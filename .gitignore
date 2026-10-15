@@ -25,3 +25,6 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 kev_check-*.tar
 
+# Secrets for compose.yaml. op.env holds only a 1Password reference, .env a plain value.
+op.env
+.env

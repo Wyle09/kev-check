@@ -1,0 +1,6 @@
+# Alerts show in this UI and go nowhere. Task 04 adds the page and ticket routes.
+route:
+  receiver: nowhere
+  group_by: [alertname, env]
+receivers:
+  - name: nowhere

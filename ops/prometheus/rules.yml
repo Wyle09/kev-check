@@ -1,0 +1,9 @@
+groups:
+  - name: meta
+    rules:
+      # Always firing. If Alertmanager stops showing it, the alert path is broken.
+      - alert: Watchdog
+        expr: vector(1)
+        labels: { severity: none }
+        annotations:
+          summary: Always fires, so a silent alert pipeline gets noticed.

@@ -1,0 +1,69 @@
+name: kev-check
+
+services:
+  app:
+    build: .
+    image: kev-check:dev
+    restart: unless-stopped
+    # The env label the roll-up rule filters on. Prometheus copies it to every series.
+    labels: { env: production }
+    deploy: { replicas: 2 }
+    mem_limit: 512m
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      PHX_HOST: localhost
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set it through op.env or .env, see the README}
+      RELEASE_TMP: /tmp
+      ERL_CRASH_DUMP: /tmp/erl_crash.dump
+      KEV_REFRESH_URL: https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json
+      KEV_REFRESH_INTERVAL_SECONDS: "21600"
+      KEV_LATENCY_MS: "25"
+      KEV_ERROR_RATE: "0"
+    # A random loopback port per container, so one copy can be reached on its own.
+    # `docker port` finds the number. Shared traffic goes through the proxy.
+    ports:
+      - 127.0.0.1::4000
+      - 127.0.0.1::9568
+
+  proxy:
+    image: nginx:1.30.6-alpine
+    restart: unless-stopped
+    volumes: ["./ops/proxy:/etc/nginx/conf.d:ro"]
+    ports: ["127.0.0.1:8080:8080"]
+    depends_on: [app]
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    restart: unless-stopped
+    # The Docker socket is root-owned inside containers. Reading it already gives
+    # control of Docker, so root adds nothing here. Never do this in production.
+    user: root
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=2d
+      - --web.enable-lifecycle
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./ops/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports: ["127.0.0.1:9090:9090"]
+
+  alertmanager:
+    image: prom/alertmanager:v0.34.1
+    restart: unless-stopped
+    volumes: ["./ops/alertmanager:/etc/alertmanager:ro"]
+    ports: ["127.0.0.1:9093:9093"]
+
+  loadgen:
+    image: curlimages/curl:8.23.0
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/loadgen/loadgen.sh"]
+    volumes: ["./ops/loadgen:/loadgen:ro"]
+    depends_on: [app]
+
+volumes:
+  prometheus-data:

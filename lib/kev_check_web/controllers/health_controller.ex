@@ -1,5 +1,5 @@
 defmodule KevCheckWeb.HealthController do
-  @moduledoc "The probe endpoint Kubernetes checks."
+  @moduledoc "The health check a load balancer or an orchestrator calls."
 
   use KevCheckWeb, :controller
 

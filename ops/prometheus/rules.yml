@@ -13,24 +13,42 @@ groups:
   - name: kev-check.sli
     rules:
       # Share of /process requests that failed on our side. 4xx is the caller's problem.
+      # A 5xx series only exists once a 5xx happens, so `or 0 * ...` stands in a 0 for
+      # each env with traffic. Without it the ratio reads empty, not 0, when all is well.
       - record: kev:http_errors:ratio_rate5m
         expr: |
-          sum by (env) (rate(http_requests_total{route="/process", status=~"5.."}[5m]))
+          (
+            sum by (env) (rate(http_requests_total{route="/process", status=~"5.."}[5m]))
+            or
+            0 * sum by (env) (rate(http_requests_total{route="/process"}[5m]))
+          )
           /
           sum by (env) (rate(http_requests_total{route="/process"}[5m]))
       - record: kev:http_errors:ratio_rate30m
         expr: |
-          sum by (env) (rate(http_requests_total{route="/process", status=~"5.."}[30m]))
+          (
+            sum by (env) (rate(http_requests_total{route="/process", status=~"5.."}[30m]))
+            or
+            0 * sum by (env) (rate(http_requests_total{route="/process"}[30m]))
+          )
           /
           sum by (env) (rate(http_requests_total{route="/process"}[30m]))
       - record: kev:http_errors:ratio_rate1h
         expr: |
-          sum by (env) (rate(http_requests_total{route="/process", status=~"5.."}[1h]))
+          (
+            sum by (env) (rate(http_requests_total{route="/process", status=~"5.."}[1h]))
+            or
+            0 * sum by (env) (rate(http_requests_total{route="/process"}[1h]))
+          )
           /
           sum by (env) (rate(http_requests_total{route="/process"}[1h]))
       - record: kev:http_errors:ratio_rate6h
         expr: |
-          sum by (env) (rate(http_requests_total{route="/process", status=~"5.."}[6h]))
+          (
+            sum by (env) (rate(http_requests_total{route="/process", status=~"5.."}[6h]))
+            or
+            0 * sum by (env) (rate(http_requests_total{route="/process"}[6h]))
+          )
           /
           sum by (env) (rate(http_requests_total{route="/process"}[6h]))
       # Share of lookups slower than 250ms, read from the histogram's 250ms bucket edge.

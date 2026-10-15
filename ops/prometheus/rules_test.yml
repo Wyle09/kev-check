@@ -1,0 +1,47 @@
+# Unit tests for rules.yml. `make reload` runs them before reloading Prometheus.
+rule_files: [rules.yml]
+evaluation_interval: 1m
+
+tests:
+  # No 5xx yet, so no 5xx series exists. Every window still reads 0, not empty.
+  - interval: 1m
+    input_series:
+      - series: 'http_requests_total{env="production", route="/process", status="200"}'
+        values: '0+60x10'
+      - series: 'http_requests_total{env="production", route="/process", status="400"}'
+        values: '0+15x10'
+    promql_expr_test:
+      - expr: kev:http_errors:ratio_rate5m
+        eval_time: 10m
+        exp_samples:
+          - labels: 'kev:http_errors:ratio_rate5m{env="production"}'
+            value: 0
+      - expr: kev:http_errors:ratio_rate30m
+        eval_time: 10m
+        exp_samples:
+          - labels: 'kev:http_errors:ratio_rate30m{env="production"}'
+            value: 0
+      - expr: kev:http_errors:ratio_rate1h
+        eval_time: 10m
+        exp_samples:
+          - labels: 'kev:http_errors:ratio_rate1h{env="production"}'
+            value: 0
+      - expr: kev:http_errors:ratio_rate6h
+        eval_time: 10m
+        exp_samples:
+          - labels: 'kev:http_errors:ratio_rate6h{env="production"}'
+            value: 0
+
+  # One 503 a second out of four requests a second.
+  - interval: 1m
+    input_series:
+      - series: 'http_requests_total{env="production", route="/process", status="200"}'
+        values: '0+180x10'
+      - series: 'http_requests_total{env="production", route="/process", status="503"}'
+        values: '0+60x10'
+    promql_expr_test:
+      - expr: kev:http_errors:ratio_rate5m
+        eval_time: 10m
+        exp_samples:
+          - labels: 'kev:http_errors:ratio_rate5m{env="production"}'
+            value: 0.25

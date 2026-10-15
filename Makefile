@@ -36,6 +36,7 @@ redeploy: ## Rebuild the image and recreate the app containers
 
 reload: ## Check the Prometheus and Alertmanager config and rules, then reload them
 	docker exec kev-check-prometheus-1 promtool check config /etc/prometheus/prometheus.yml
+	docker exec kev-check-prometheus-1 promtool test rules /etc/prometheus/rules_test.yml
 	docker exec kev-check-alertmanager-1 amtool check-config /etc/alertmanager/alertmanager.yml
 	curl -fsS -X POST localhost:9090/-/reload
 	curl -fsS -X POST localhost:9093/-/reload

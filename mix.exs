@@ -5,11 +5,13 @@ defmodule KevCheck.MixProject do
     [
       app: :kev_check,
       version: "0.1.0",
-      elixir: "~> 1.17",
+      elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
       deps: deps(),
+      compilers: [:boundary] ++ Mix.compilers(),
+      boundary: [default: [check: [apps: [:phoenix, :bandit]]]],
       listeners: [Phoenix.CodeReloader]
     ]
   end
@@ -44,7 +46,10 @@ defmodule KevCheck.MixProject do
       {:telemetry_poller, "~> 1.0"},
       {:jason, "~> 1.2"},
       {:dns_cluster, "~> 0.2.0"},
-      {:bandit, "~> 1.5"}
+      {:bandit, "~> 1.5"},
+      {:boundary, "~> 0.11.0", runtime: false},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
     ]
   end
 

@@ -1,9 +1,10 @@
 defmodule KevCheck do
   @moduledoc """
-  KevCheck keeps the contexts that define your domain
-  and business logic.
+  Answers one question: is this CVE on CISA's Known Exploited Vulnerabilities catalog?
 
-  Contexts are also responsible for managing your data, regardless
-  if it comes from the database, an external API or others.
+  Pure parsing and lookup live under `Core`. Everything else here holds state or
+  talks to the outside world.
   """
+
+  use Boundary, deps: [], exports: [{Core, []}]
 end

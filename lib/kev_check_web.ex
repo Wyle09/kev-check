@@ -17,6 +17,8 @@ defmodule KevCheckWeb do
   those modules here.
   """
 
+  use Boundary, deps: [KevCheck, Phoenix], exports: [Endpoint, Telemetry]
+
   def static_paths, do: ~w(assets fonts images favicon.ico robots.txt)
 
   def router do

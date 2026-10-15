@@ -44,7 +44,6 @@ defmodule KevCheck.Application do
 
   defp metrics_server(true = _endpoint_serves?) do
     opts = Application.fetch_env!(:kev_check, :metrics_server)
-    # HTTP/2 stays off until Bandit fixes EEF-CVE-2026-105659.
-    [{Bandit, [plug: KevCheckWeb.MetricsPlug, http_2_options: [enabled: false]] ++ opts}]
+    [{Bandit, [plug: KevCheckWeb.MetricsPlug] ++ opts}]
   end
 end

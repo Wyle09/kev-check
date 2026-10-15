@@ -21,11 +21,7 @@ if System.get_env("PHX_SERVER") do
 end
 
 config :kev_check, KevCheckWeb.Endpoint,
-  # HTTP/2 stays off until Bandit fixes EEF-CVE-2026-105659. Nothing here needs it.
-  http: [
-    port: String.to_integer(System.get_env("PORT", "4000")),
-    http_2_options: [enabled: false]
-  ]
+  http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 
 if config_env() != :test do
   {error_rate, ""} = Float.parse(System.get_env("KEV_ERROR_RATE", "0"))

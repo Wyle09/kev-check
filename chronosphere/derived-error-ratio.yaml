@@ -1,0 +1,17 @@
+# A friendly name for a query, computed when someone asks. Nothing extra is stored.
+api_version: v1/config
+kind: DerivedMetric
+spec:
+  name: KEV check error ratio
+  slug: kev-check-error-ratio
+  metric_name: kev_check_error_ratio
+  description: Share of /process lookups that couldn't be answered, by environment.
+  queries:
+    - query:
+        prometheus_expr: |
+          sum by (env) (rate(kev_process_errors_total{$env}[5m]))
+          /
+          (sum by (env) (rate(kev_process_errors_total{$env}[5m])) + sum by (env) (rate(kev_process_success_total{$env}[5m])))
+        variables:
+          - name: env
+            default_prometheus_selector: env=~".*"

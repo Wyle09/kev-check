@@ -1,0 +1,14 @@
+# Drop request counts for health check traffic. On Kubernetes, probes hit every pod
+# every few seconds, forever, and nobody graphs them.
+api_version: v1/config
+kind: DropRule
+spec:
+  name: Drop kev-check health check request counts
+  slug: drop-kev-check-healthz
+  filters:
+    - name: __name__
+      value_glob: http_requests_total
+    - name: route
+      value_glob: /healthz
+  # Watch chrono_metrics_drop_rule_dpps_matched{slug="drop-kev-check-healthz"}, then ENABLED.
+  mode: PREVIEW

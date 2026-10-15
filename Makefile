@@ -34,9 +34,11 @@ scale: ## Run N app containers, for example make scale N=4
 redeploy: ## Rebuild the image and recreate the app containers
 	$(COMPOSE) up -d --build app
 
-reload: ## Check the Prometheus config and rules, then reload them
+reload: ## Check the Prometheus and Alertmanager config and rules, then reload them
 	docker exec kev-check-prometheus-1 promtool check config /etc/prometheus/prometheus.yml
+	docker exec kev-check-alertmanager-1 amtool check-config /etc/alertmanager/alertmanager.yml
 	curl -fsS -X POST localhost:9090/-/reload
+	curl -fsS -X POST localhost:9093/-/reload
 
 faults: ## Change fault knobs on every app container, for example make faults LATENCY_MS=400 ERROR_RATE=0.2
 	@test -n "$(FAULTS)" || { echo "Pass LATENCY_MS, ERROR_RATE, or both."; exit 1; }

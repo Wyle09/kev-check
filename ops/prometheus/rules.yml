@@ -7,3 +7,92 @@ groups:
         labels: { severity: none }
         annotations:
           summary: Always fires, so a silent alert pipeline gets noticed.
+
+  # Every ratio is grouped by env, never by pod: one alert per environment, and the
+  # rules keep working after the roll-up removes pod and instance.
+  - name: kev-check.sli
+    rules:
+      # Share of /process requests that failed on our side. 4xx is the caller's problem.
+      - record: kev:http_errors:ratio_rate5m
+        expr: |
+          sum by (env) (rate(http_requests_total{route="/process", status=~"5.."}[5m]))
+          /
+          sum by (env) (rate(http_requests_total{route="/process"}[5m]))
+      - record: kev:http_errors:ratio_rate30m
+        expr: |
+          sum by (env) (rate(http_requests_total{route="/process", status=~"5.."}[30m]))
+          /
+          sum by (env) (rate(http_requests_total{route="/process"}[30m]))
+      - record: kev:http_errors:ratio_rate1h
+        expr: |
+          sum by (env) (rate(http_requests_total{route="/process", status=~"5.."}[1h]))
+          /
+          sum by (env) (rate(http_requests_total{route="/process"}[1h]))
+      - record: kev:http_errors:ratio_rate6h
+        expr: |
+          sum by (env) (rate(http_requests_total{route="/process", status=~"5.."}[6h]))
+          /
+          sum by (env) (rate(http_requests_total{route="/process"}[6h]))
+      # Share of lookups slower than 250ms, read from the histogram's 250ms bucket edge.
+      - record: kev:process_slow:ratio_rate5m
+        expr: |
+          1 - (
+            sum by (env) (rate(kev_process_duration_seconds_bucket{le="0.25"}[5m]))
+            /
+            sum by (env) (rate(kev_process_duration_seconds_count[5m]))
+          )
+
+  - name: kev-check.rollup-preview
+    rules:
+      # What the Chronosphere roll-up in chronosphere/ keeps, approximated in PromQL.
+      # It stores a rate, not a counter: Prometheus can't sum counters safely across restarts.
+      - record: rollup_preview:http_requests_total:rate1m
+        expr: sum without (pod, instance) (rate(http_requests_total{env="production"}[1m]))
+
+  # SLO: 99.9% of /process requests succeed, 95% finish within 250ms. Burn-rate pairs
+  # from the Google SRE workbook. The paging alerts wait 2 minutes so they fire during
+  # a demo; production would use 5 or more.
+  - name: kev-check.alerts
+    rules:
+      - alert: KevCheckErrorBudgetFastBurn
+        expr: |
+          kev:http_errors:ratio_rate5m{env="production"} > (14.4 * 0.001)
+          and
+          kev:http_errors:ratio_rate1h{env="production"} > (14.4 * 0.001)
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: Production is burning its error budget 14 times too fast.
+          description: More than 1.44% of /process requests failed with a 5xx over the last 5 minutes and the last hour. At this rate the 99.9% monthly budget lasts about two days.
+      - alert: KevCheckErrorBudgetSlowBurn
+        expr: |
+          kev:http_errors:ratio_rate30m{env="production"} > (6 * 0.001)
+          and
+          kev:http_errors:ratio_rate6h{env="production"} > (6 * 0.001)
+        for: 15m
+        labels: { severity: ticket }
+        annotations:
+          summary: Production is leaking error budget.
+          description: More than 0.6% of /process requests failed with a 5xx over the last 30 minutes and 6 hours. At this rate the monthly budget lasts about five days.
+      - alert: KevCheckSlowLookups
+        expr: kev:process_slow:ratio_rate5m{env="production"} > 0.05
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: More than 5% of production lookups take longer than 250ms.
+          description: The latency SLO says 95% of lookups finish within 250ms. Check the `make faults` settings first, then the catalog store.
+      - alert: KevCheckCatalogStale
+        expr: max by (env) (kev_catalog_age_seconds{env="production"}) > 7 * 86400
+        for: 30m
+        labels: { severity: ticket }
+        annotations:
+          summary: A production container is serving a KEV catalog more than 7 days old.
+          description: The refresh from CISA is failing or CISA hasn't published. Look for "KEV refresh failed" in the logs.
+      # absent() of a comparison carries no labels, so env is set here for routing.
+      - alert: KevCheckMetricsMissing
+        expr: absent(up{job="kev-check", env="production"} == 1)
+        for: 5m
+        labels: { severity: page, env: production }
+        annotations:
+          summary: No production kev-check container is reporting metrics.
+          description: Every other kev-check alert is blind while this fires. Check the containers, then localhost:9090/targets.

@@ -1,0 +1,29 @@
+# Roll up http_requests_total in production: remove the per-pod and per-instance
+# labels, store one point per remaining label set every 60s, and drop the raw input.
+# Apply with: chronoctl apply -f chronosphere/rollup-http-requests-total.yaml
+api_version: v1/config
+kind: RollupRule
+spec:
+  slug: http-requests-total-production-without-pod-instance
+  name: http_requests_total in production without pod and instance
+  # Both must match, so other environments pass through untouched.
+  filters:
+    - name: __name__
+      value_glob: http_requests_total
+    - name: env
+      value_glob: production
+  metric_name: '{{ .MetricName }}:without_pod_instance'
+  # SUM takes each input series' increase per interval, then adds them up, so the
+  # output is a cumulative counter again and rate() still works on it.
+  metric_type: CUMULATIVE_COUNTER
+  aggregation: SUM
+  interval: 60s
+  # discard keeps every other label. keep would skip any series missing a listed label.
+  label_policy:
+    discard:
+      - pod
+      - instance
+  drop_raw: true
+  add_metric_type_label: true
+  # PREVIEW reports the impact without changing stored data. Roll out in PREVIEW first.
+  mode: ENABLED

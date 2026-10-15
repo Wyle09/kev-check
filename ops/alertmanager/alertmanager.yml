@@ -1,6 +1,19 @@
-# Alerts show in this UI and go nowhere. Task 04 adds the page and ticket routes.
+# Alerts show in this UI and go nowhere. In production, pager would hold
+# pagerduty_configs and tickets a webhook into the ticket queue.
 route:
   receiver: nowhere
   group_by: [alertname, env]
+  routes:
+    - matchers: [severity="page"]
+      receiver: pager
+    - matchers: [severity="ticket"]
+      receiver: tickets
 receivers:
   - name: nowhere
+  - name: pager
+  - name: tickets
+inhibit_rules:
+  # The fast burn already paged, so the slow-burn ticket for the same env is noise.
+  - source_matchers: [alertname="KevCheckErrorBudgetFastBurn"]
+    target_matchers: [alertname="KevCheckErrorBudgetSlowBurn"]
+    equal: [env]

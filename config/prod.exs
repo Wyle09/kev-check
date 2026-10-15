@@ -1,16 +1,11 @@
 import Config
 
-# Force using SSL in production. This also sets the "strict-security-transport" header,
-# known as HSTS. If you have a health check endpoint, you may want to exclude it below.
-# Note `:force_ssl` is required to be set at compile-time.
-config :kev_check, KevCheckWeb.Endpoint,
-  force_ssl: [
-    rewrite_on: [:x_forwarded_proto],
-    exclude: [
-      # paths: ["/health"],
-      hosts: ["localhost", "127.0.0.1"]
-    ]
-  ]
+# No force_ssl: TLS ends at the load balancer, and inside the cluster a forced
+# redirect would bounce the probes and the load generator.
+
+# The lookup log line replaces Phoenix's per-request lines. The JSON formatter is
+# set in config/runtime.exs.
+config :phoenix, :logger, false
 
 # Do not print debug messages in production
 config :logger, level: :info

@@ -21,9 +21,38 @@ if System.get_env("PHX_SERVER") do
 end
 
 config :kev_check, KevCheckWeb.Endpoint,
-  http: [port: String.to_integer(System.get_env("PORT", "4000"))]
+  # HTTP/2 stays off until Bandit fixes EEF-CVE-2026-105659. Nothing here needs it.
+  http: [
+    port: String.to_integer(System.get_env("PORT", "4000")),
+    http_2_options: [enabled: false]
+  ]
+
+if config_env() != :test do
+  {error_rate, ""} = Float.parse(System.get_env("KEV_ERROR_RATE", "0"))
+
+  config :kev_check, :metrics_server,
+    port: String.to_integer(System.get_env("METRICS_PORT", "9568"))
+
+  config :kev_check, KevCheck.Catalog.Store,
+    refresh_url: System.get_env("KEV_REFRESH_URL"),
+    refresh_interval_ms:
+      :timer.seconds(String.to_integer(System.get_env("KEV_REFRESH_INTERVAL_SECONDS", "21600")))
+
+  config :kev_check, KevCheck.Faults,
+    latency_ms: String.to_integer(System.get_env("KEV_LATENCY_MS", "0")),
+    error_rate: error_rate
+end
 
 if config_env() == :prod do
+  # One JSON object per line, for the log pipeline, with the metadata keys
+  # config/config.exs lists. new/1 builds the formatter once here instead of on every
+  # log call, which is why this isn't in config/prod.exs.
+  config :logger, :default_handler,
+    formatter:
+      LoggerJSON.Formatters.Basic.new(
+        metadata: {:from_application_env, {:logger, :default_formatter}, [:metadata]}
+      )
+
   # The secret key base is used to sign/encrypt cookies and other secrets.
   # A default value is used in config/dev.exs and config/test.exs but you
   # want to use a different value for prod and you most likely don't want

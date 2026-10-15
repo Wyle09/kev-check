@@ -42,8 +42,11 @@ config :kev_check, KevCheckWeb.Endpoint,
 # Enable dev routes for dashboard and mailbox
 config :kev_check, dev_routes: true
 
-# Do not include metadata nor timestamps in development logs
-config :logger, :default_formatter, format: "[$level] $message\n"
+# Like the endpoint above, only this machine can scrape metrics in development.
+config :kev_check, :metrics_server, ip: {127, 0, 0, 1}
+
+# No timestamps in development logs. Metadata stays, so the lookup fields show up.
+config :logger, :default_formatter, format: "[$level] $message $metadata\n"
 
 # Set a higher stacktrace during development. Avoid configuring such
 # in production as building large stacktraces may be expensive.

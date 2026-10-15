@@ -24,7 +24,26 @@ config :kev_check, KevCheckWeb.Endpoint,
 # Configure Elixir's Logger
 config :logger, :default_formatter,
   format: "$time $metadata[$level] $message\n",
-  metadata: [:request_id]
+  metadata: [
+    :request_id,
+    :event,
+    :outcome,
+    :reason,
+    :cve_id,
+    :raw_id,
+    :known_exploited,
+    :duration_ms
+  ]
+
+config :kev_check, KevCheck.Catalog.Store,
+  snapshot_path: nil,
+  refresh_url: nil,
+  refresh_interval_ms: :timer.hours(6)
+
+config :kev_check, KevCheck.Faults, latency_ms: 0, error_rate: 0.0
+
+# Prometheus scrapes this port. The API port never serves /metrics.
+config :kev_check, :metrics_server, port: 9568
 
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason

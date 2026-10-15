@@ -7,6 +7,9 @@ config :kev_check, KevCheckWeb.Endpoint,
   secret_key_base: "FUUlqLqWxRZc0RhrqRXAsIzB6dW2ecgqCEZgkXvUbWGukuDvzPdpB5N66GftaeM1",
   server: false
 
+config :kev_check, KevCheck.Catalog.Store,
+  snapshot_path: Path.expand("../test/support/fixtures/kev_fixture.json", __DIR__)
+
 # Print only warnings and errors during test
 config :logger, level: :warning
 

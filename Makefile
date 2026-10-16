@@ -2,8 +2,8 @@
 
 BUILDER_IMAGE := hexpm/elixir:1.20.3-erlang-29.0.5-debian-trixie-20260824-slim
 
-# compose.yaml reads SECRET_KEY_BASE, so every Compose command needs it, even ps and down.
-COMPOSE := $(if $(wildcard op.env),op run --env-file=op.env --) docker compose
+# compose.yaml reads SECRET_KEY_BASE from .env, so every Compose command needs it, even ps and down.
+COMPOSE := docker compose
 # App containers, found by Compose's own labels.
 APP := docker ps --format '{{.Names}}' --filter label=com.docker.compose.project=kev-check --filter label=com.docker.compose.service=app
 

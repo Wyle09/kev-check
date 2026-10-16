@@ -15,7 +15,7 @@ services:
     security_opt: ["no-new-privileges:true"]
     environment:
       PHX_HOST: localhost
-      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set it through op.env or .env, see the README}
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set it in .env, see the README}
       RELEASE_TMP: /tmp
       ERL_CRASH_DUMP: /tmp/erl_crash.dump
       KEV_REFRESH_URL: https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json

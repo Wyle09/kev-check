@@ -28,11 +28,11 @@ status: ## Show the containers and the URLs
 	@echo "  Prometheus    http://localhost:9090"
 	@echo "  Alertmanager  http://localhost:9093"
 
-scale: ## Run N app containers, for example make scale N=4
-	$(COMPOSE) up -d --no-recreate --scale app=$(N) app
+scale: ## Run N app containers, for example make scale N=4. Starts anything else that's down
+	$(COMPOSE) up -d --no-recreate --scale app=$(N)
 
-redeploy: ## Rebuild the image and recreate the app containers
-	$(COMPOSE) up -d --build app
+redeploy: ## Rebuild the image and recreate the app containers. Starts anything else that's down
+	$(COMPOSE) up -d --build
 
 reload: ## Check the Prometheus and Alertmanager config and rules, then reload them
 	docker exec kev-check-prometheus-1 promtool check config /etc/prometheus/prometheus.yml

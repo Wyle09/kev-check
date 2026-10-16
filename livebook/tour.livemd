@@ -1,0 +1,3568 @@
+<!-- livebook:{"autosave_interval_s":null} -->
+
+# KEV check, live
+
+```elixir
+Mix.install([
+  {:kino, "~> 0.19.1"},
+  {:kino_vega_lite, "~> 0.1.13"},
+  {:req, "~> 0.7.5"}
+])
+```
+
+## Start here
+
+A live tour of KEV check. The notebook starts the stack, checks it, and then goes through the app, its metrics and logs, the histogram, running several copies, following a request across containers, the alerts, and the Chronosphere roll-up rule. Every number comes from the running stack.
+
+How to use it:
+
+* Run a cell with the ▶ above it, or Cmd+Enter. **Evaluate all** in the notebook menu runs every cell. Nothing changes the stack until you press a button.
+* The first run downloads three libraries, about a minute. Then run the Toolbox, press **Start** in the Control room, and run Preflight.
+* The alert rules look back 1 hour and the charts 15 minutes, so a new stack takes that long to fill in.
+* Sections that change the stack have a reset. Wrap up resets everything.
+
+Click a section to jump to it.
+
+| Section                                                                | What it covers                                                                  |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| [Toolbox](#toolbox-the-notebooks-own-code)                             | The notebook's own code, and its tests                                          |
+| [Control room](#control-room-run-the-stack-from-here)                  | Start, scale, rebuild, test, and stop the stack without a terminal              |
+| [Preflight](#preflight-is-everything-ready)                            | Whether Docker, the containers, Prometheus, Alertmanager, and the app are ready |
+| [1. The question KEV check answers](#1-the-question-kev-check-answers) | The app, and what counts as an error                                            |
+| [2. One request, five signals](#2-one-request-five-signals)            | Why each signal has its type, shown with a single request                       |
+| [3. Histogram x-ray](#3-histogram-xray)                                | How bucket counts become a p95, worked out step by step                         |
+| [4. Many copies](#4-many-copies)                                       | Adding up metrics across containers, through restarts, and series growth        |
+| [5. Across services](#5-across-services)                               | Following one request across containers, and what changes with many services    |
+| [6. Alerting](#6-alerting)                                             | Burn-rate alerts on an SLO, with faults you can turn on                         |
+| [7. Chronosphere: shaping the data](#7-chronosphere-shaping-the-data)  | Drop, recording, roll-up, and derived rules, and the roll-up rule itself        |
+| [The requirements, checked live](#the-requirements-checked-live)       | Every requirement for the app, graded against the running stack                 |
+| [Wrap up](#wrap-up)                                                    | Reset the faults, and stop the stack                                            |
+
+### Reading the Elixir
+
+The Elixir that shows up in the code cells:
+
+| You'll see                                                             | It means                                                                                                                                                      |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `defmodule Tour.Core.Quantile do ... end`                              | A module, a named group of functions. `Core` in the name means pure: data in, data out, no Docker, HTTP, or clock. Every other module is the shell around it. |
+| `def estimate(q, buckets)` and `defp`                                  | A public function, and a private helper.                                                                                                                      |
+| `@doc "..."` above `@spec estimate(float(), [bucket()]) :: estimate()` | One line on what the function returns, then its types: inputs before `::`, output after.                                                                      |
+| `:ok`, `:inf`                                                          | Atoms, named constants like an enum value.                                                                                                                    |
+| `{:ok, value}` and `{:error, "why"}`                                   | Tuples. A function that can fail returns one of these two shapes instead of throwing.                                                                         |
+| `%{"le" => "0.25"}` and `%{name: "app-1"}`                             | Maps (dictionaries). The second form has atom keys, read with `map.name`.                                                                                     |
+| `{:ok, body} = fetch()`                                                | `=` is a match: it checks the shape on the left and pulls `body` out of it.                                                                                   |
+| Two `def`s with the same name                                          | Elixir runs the first clause whose arguments match. That's how the code branches instead of `if`.                                                             |
+| `with {:ok, a} <- step1(), {:ok, b} <- step2(a) do`                    | Run steps in order and stop at the first one that doesn't return `{:ok, ...}`.                                                                                |
+| `Enum.map(list, fn x -> x * 2 end)` and `&(&1 * 2)`                    | Loop over a list. `&(&1 * 2)` is shorthand for the same anonymous function.                                                                                   |
+| `"#{name} is up"` and `~r/regex/`                                      | String interpolation, and a regular expression.                                                                                                               |
+| `Kino.Control.button("Spin")`                                          | Kino is Livebook's UI library. This makes a button.                                                                                                           |
+| `Kino.listen(button, fn _click -> ... end)`                            | Run the function every time the button is pressed.                                                                                                            |
+| `Kino.Frame.new()`                                                     | A box on the page that code can redraw. That's how charts refresh.                                                                                            |
+
+The pipe, `|>`, passes a value into the next call: `x |> f() |> g(2)` is `g(f(x), 2)`.
+
+## Toolbox: the notebook's own code
+
+The notebook's own modules. `Tour.Core.*` modules are pure functions with tests. The rest call Docker, Prometheus, and the app. Run this section once before the others.
+
+`Tour.Config` holds paths and URLs. Livebook opened from the Dock gets a minimal `PATH`, so this cell adds the folders where `docker` usually lives.
+
+```elixir
+defmodule Tour.Config do
+  @moduledoc """
+  Where things live: the repo checkout, the three local URLs, and the secret in `.env`.
+  """
+
+  @extra_path [
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    "~/.docker/bin",
+    "/Applications/Docker.app/Contents/Resources/bin"
+  ]
+
+  @doc "The kev-check checkout: `KEV_CHECK_DIR` when set, otherwise the folder above this notebook."
+  @spec repo() :: Path.t()
+  def repo, do: System.get_env("KEV_CHECK_DIR") || Path.expand("..", __DIR__)
+
+  @doc "The app, through the nginx proxy that spreads requests across the containers."
+  @spec app_url() :: String.t()
+  def app_url, do: "http://localhost:8080"
+
+  @doc "Prometheus's UI and API."
+  @spec prometheus_url() :: String.t()
+  def prometheus_url, do: "http://localhost:9090"
+
+  @doc "Alertmanager's UI and API."
+  @spec alertmanager_url() :: String.t()
+  def alertmanager_url, do: "http://localhost:9093"
+
+  @doc "True when `.env` sets the `SECRET_KEY_BASE` Compose needs."
+  @spec secret?() :: boolean()
+  def secret? do
+    case File.read(Path.join(repo(), ".env")) do
+      {:ok, text} -> Regex.match?(~r/^SECRET_KEY_BASE=\S+/m, text)
+      {:error, _missing} -> false
+    end
+  end
+
+  @doc "Add a random `SECRET_KEY_BASE` to `.env`, unless it already sets one."
+  @spec create_env() :: {:ok, String.t()} | {:error, String.t()}
+  def create_env do
+    case secret?() do
+      true -> {:error, ".env already sets SECRET_KEY_BASE, so I left it alone."}
+      false -> write_secret()
+    end
+  end
+
+  @doc "Add Docker's and Homebrew's folders to the end of `PATH`."
+  @spec extend_path() :: :ok
+  def extend_path do
+    path =
+      System.get_env("PATH", "")
+      |> String.split(":", trim: true)
+      |> Enum.concat(Enum.map(@extra_path, &Path.expand/1))
+      |> Enum.uniq()
+      |> Enum.join(":")
+
+    System.put_env("PATH", path)
+  end
+
+  defp write_secret do
+    key = 48 |> :crypto.strong_rand_bytes() |> Base.encode64()
+
+    case File.write(Path.join(repo(), ".env"), "SECRET_KEY_BASE=#{key}\n", [:append]) do
+      :ok -> {:ok, "Wrote a random SECRET_KEY_BASE to .env."}
+      {:error, reason} -> {:error, "Couldn't write .env: #{:file.format_error(reason)}"}
+    end
+  end
+end
+
+Tour.Config.extend_path()
+ExUnit.start(autorun: false)
+Tour.Config.repo()
+```
+
+`Tour.Shell` runs a command in the repo. `run/2` returns the output when the command finishes. `stream/3` passes output along as it arrives, for slow commands like a build.
+
+```elixir
+defmodule Tour.Shell do
+  @moduledoc """
+  Runs a command in the repo folder, either collecting its output or streaming it chunk by
+  chunk for slow work like a Docker build.
+  """
+
+  @type result :: {:ok, String.t()} | {:error, String.t()}
+
+  @doc "Run `command` with `args` and return its combined output, tagged by whether it exited 0."
+  @spec run(String.t(), [String.t()]) :: result()
+  def run(command, args) do
+    with {:ok, path} <- find(command) do
+      {output, status} = System.cmd(path, args, cd: Tour.Config.repo(), stderr_to_stdout: true)
+      tag(status, output)
+    end
+  end
+
+  @doc "Like `run/2`, but hands each chunk of output to `on_output` as soon as it arrives."
+  @spec stream(String.t(), [String.t()], (String.t() -> term())) :: result()
+  def stream(command, args, on_output) do
+    case find(command) do
+      {:ok, path} ->
+        {:spawn_executable, path}
+        |> Port.open([
+          :binary,
+          :exit_status,
+          :stderr_to_stdout,
+          args: args,
+          cd: Tour.Config.repo()
+        ])
+        |> collect(on_output, [])
+
+      {:error, message} = error ->
+        on_output.(message)
+        error
+    end
+  end
+
+  defp collect(port, on_output, acc) do
+    receive do
+      {^port, {:data, chunk}} ->
+        on_output.(chunk)
+        collect(port, on_output, [acc, chunk])
+
+      {^port, {:exit_status, status}} ->
+        tag(status, IO.iodata_to_binary(acc))
+    end
+  end
+
+  defp find(command) do
+    cond do
+      not File.dir?(Tour.Config.repo()) ->
+        {:error, "There's no checkout at #{Tour.Config.repo()}. Set KEV_CHECK_DIR."}
+
+      path = System.find_executable(command) ->
+        {:ok, path}
+
+      true ->
+        {:error, "#{command} isn't on PATH. Is it installed?"}
+    end
+  end
+
+  defp tag(0, output), do: {:ok, output}
+  defp tag(_status, output), do: {:error, output}
+end
+```
+
+Pure modules. `PromJSON` converts Prometheus API values, which arrive as strings and can be `"NaN"` or `"+Inf"`. `Containers` parses `docker ps`. `Faults` builds the Elixir snippets that change a container's fault settings, and only accepts numbers in range. `LogLine` parses the app's JSON log lines.
+
+```elixir
+defmodule Tour.Core.PromJSON do
+  @moduledoc """
+  Turns Prometheus API results into plain maps with numbers. Prometheus sends every value
+  as a string, and "NaN" and "+Inf" can't be Elixir floats, so they become atoms.
+  """
+
+  @type value :: float() | :nan | :inf | :neg_inf
+  @type sample :: %{labels: %{String.t() => String.t()}, value: value()}
+  @type series :: %{labels: %{String.t() => String.t()}, points: [{integer(), value()}]}
+
+  @doc "The samples in an instant query's `data`."
+  @spec vector(map()) :: [sample()]
+  def vector(%{"resultType" => "vector", "result" => result}), do: Enum.map(result, &sample/1)
+
+  def vector(%{"resultType" => "scalar", "result" => [_time, value]}),
+    do: [%{labels: %{}, value: value(value)}]
+
+  @doc "The series in a range query's `data`, each point a unix time and a value."
+  @spec matrix(map()) :: [series()]
+  def matrix(%{"resultType" => "matrix", "result" => result}), do: Enum.map(result, &series/1)
+
+  @doc "One value the way Prometheus writes it, as a float or a named non-number."
+  @spec value(String.t()) :: value()
+  def value("NaN"), do: :nan
+  def value("+Inf"), do: :inf
+  def value("-Inf"), do: :neg_inf
+
+  def value(text) do
+    {number, ""} = Float.parse(text)
+    number
+  end
+
+  defp sample(%{"metric" => labels, "value" => [_time, value]}),
+    do: %{labels: labels, value: value(value)}
+
+  defp series(%{"metric" => labels, "values" => values}),
+    do: %{
+      labels: labels,
+      points: Enum.map(values, fn [time, value] -> {trunc(time), value(value)} end)
+    }
+end
+```
+
+```elixir
+defmodule Tour.Core.Containers do
+  @moduledoc """
+  Turns `docker ps --format '{{json .}}'` output, one JSON object per line, into plain maps.
+  """
+
+  @type t :: %{
+          name: String.t(),
+          service: String.t(),
+          number: non_neg_integer(),
+          state: String.t(),
+          status: String.t(),
+          ports: %{pos_integer() => pos_integer()}
+        }
+
+  @doc "Parse every line that is a container, sorted by service and then by replica number."
+  @spec parse(String.t()) :: [t()]
+  def parse(output) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.flat_map(&container/1)
+    |> Enum.sort_by(&{&1.service, &1.number})
+  end
+
+  @doc "The app containers that are running, in replica order."
+  @spec running_apps([t()]) :: [t()]
+  def running_apps(containers),
+    do: Enum.filter(containers, &match?(%{service: "app", state: "running"}, &1))
+
+  defp container(line) do
+    case JSON.decode(line) do
+      {:ok, %{"Names" => name, "State" => state, "Status" => status, "Labels" => labels} = row} ->
+        [
+          %{
+            name: name,
+            service: label(labels, "com.docker.compose.service"),
+            number: labels |> label("com.docker.compose.container-number") |> to_integer(),
+            state: state,
+            status: status,
+            ports: ports(Map.get(row, "Ports", ""))
+          }
+        ]
+
+      _not_a_container ->
+        []
+    end
+  end
+
+  defp label(labels, key) do
+    case Regex.run(~r/(?:^|,)#{Regex.escape(key)}=([^,]*)/, labels, capture: :all_but_first) do
+      [value] -> value
+      nil -> ""
+    end
+  end
+
+  # "127.0.0.1:59918->4000/tcp" means container port 4000 is host port 59918.
+  defp ports(text) do
+    for [host, container] <- Regex.scan(~r/:(\d+)->(\d+)\/tcp/, text, capture: :all_but_first),
+        into: %{},
+        do: {String.to_integer(container), String.to_integer(host)}
+  end
+
+  defp to_integer(""), do: 0
+  defp to_integer(text), do: String.to_integer(text)
+end
+```
+
+```elixir
+defmodule Tour.Core.Faults do
+  @moduledoc """
+  Writes the one-line Elixir snippets that read or change an app container's fault knobs,
+  and reads their JSON answers. Only numbers that pass the guards reach a snippet.
+  """
+
+  @type settings :: %{latency_ms: non_neg_integer(), error_rate: float()}
+  @type status :: %{current: settings(), boot: settings() | nil}
+
+  @doc "A snippet that prints the knobs in effect and the boot values from config."
+  @spec status_code() :: String.t()
+  def status_code,
+    do:
+      "IO.puts(JSON.encode!(%{current: KevCheck.Faults.current(), " <>
+        "boot: Map.new(Application.get_env(:kev_check, KevCheck.Faults))}))"
+
+  @doc "A snippet that sets both knobs, or why the values were refused."
+  @spec put_code(term(), term()) :: {:ok, String.t()} | {:error, String.t()}
+  def put_code(latency_ms, error_rate)
+      when is_integer(latency_ms) and latency_ms in 0..5_000 and is_number(error_rate) and
+             error_rate >= 0 and error_rate <= 1 do
+    {:ok,
+     "IO.puts(JSON.encode!(%{current: KevCheck.Faults.put(" <>
+       "latency_ms: #{latency_ms}, error_rate: #{error_rate * 1.0})}))"}
+  end
+
+  def put_code(latency_ms, error_rate),
+    do:
+      {:error,
+       "Latency has to be 0 to 5000 ms and the error rate 0 to 1, " <>
+         "got #{inspect(latency_ms)} and #{inspect(error_rate)}."}
+
+  @doc "A snippet that puts the knobs back to their boot values."
+  @spec reset_code() :: String.t()
+  def reset_code, do: "IO.puts(JSON.encode!(%{current: KevCheck.Faults.reset()}))"
+
+  @doc "Read the knobs from a snippet's output, whose last line is the JSON."
+  @spec parse(String.t()) :: {:ok, status()} | {:error, String.t()}
+  def parse(output) do
+    with [line | _earlier] <- output |> String.split("\n", trim: true) |> Enum.reverse(),
+         {:ok, %{"current" => current} = answer} <- JSON.decode(line) do
+      {:ok, %{current: settings(current), boot: settings(answer["boot"])}}
+    else
+      _unreadable -> {:error, String.trim(output)}
+    end
+  end
+
+  @doc "The knobs in words, like `up to 400 ms, 20% errors`."
+  @spec describe(settings()) :: String.t()
+  def describe(%{latency_ms: ms, error_rate: rate}),
+    do: "up to #{ms} ms, #{round(rate * 100)}% errors"
+
+  defp settings(%{"latency_ms" => ms, "error_rate" => rate}),
+    do: %{latency_ms: ms, error_rate: rate * 1.0}
+
+  defp settings(nil), do: nil
+end
+```
+
+```elixir
+defmodule Tour.Core.LogLine do
+  @moduledoc """
+  Reads the app's JSON log lines into flat rows. Anything that isn't one of the app's JSON
+  lines is skipped.
+  """
+
+  @type row :: %{
+          time: String.t(),
+          pod: String.t(),
+          level: String.t(),
+          message: String.t(),
+          outcome: String.t() | nil,
+          reason: String.t() | nil,
+          cve_id: String.t() | nil,
+          duration_ms: number() | nil,
+          request_id: String.t() | nil
+        }
+
+  @doc "Every JSON log line in `output`, oldest first, tagged with the container it came from."
+  @spec rows(String.t(), String.t()) :: [row()]
+  def rows(output, pod) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.flat_map(&row(&1, pod))
+  end
+
+  @doc "The raw line that carries `request_id`, exactly as the app wrote it."
+  @spec find(String.t(), String.t() | nil) :: {:ok, String.t()} | :error
+  def find(_output, nil), do: :error
+
+  def find(output, request_id) do
+    needle = ~s("request_id":"#{request_id}")
+
+    case output |> String.split("\n") |> Enum.find(&String.contains?(&1, needle)) do
+      nil -> :error
+      line -> {:ok, line}
+    end
+  end
+
+  defp row(line, pod) do
+    case JSON.decode(line) do
+      {:ok, %{"message" => message, "time" => time, "severity" => level} = entry} ->
+        meta = Map.get(entry, "metadata", %{})
+
+        [
+          %{
+            time: time,
+            pod: pod,
+            level: level,
+            message: message,
+            outcome: meta["outcome"],
+            reason: meta["reason"],
+            cve_id: meta["cve_id"],
+            duration_ms: meta["duration_ms"],
+            request_id: meta["request_id"]
+          }
+        ]
+
+      _not_ours ->
+        []
+    end
+  end
+end
+```
+
+Fault settings end up as code inside a container, so this checks that only numbers in range get through.
+
+```elixir
+defmodule Tour.FaultsTest do
+  use ExUnit.Case, async: true
+
+  alias Tour.Core.Faults
+
+  test "fault snippets only take numbers in range" do
+    assert {:ok, code} = Faults.put_code(400, 0.2)
+    assert code =~ "latency_ms: 400, error_rate: 0.2"
+
+    for {ms, rate} <- [{-1, 0}, {5_001, 0}, {0, 1.5}, {"400", 0}, {400, "0.2); System.halt("}] do
+      assert {:error, _why} = Faults.put_code(ms, rate)
+    end
+  end
+end
+
+ExUnit.run()
+```
+
+`Tour.Docker` wraps the Docker CLI. It only acts on running app containers of this Compose project.
+
+```elixir
+defmodule Tour.Docker do
+  @moduledoc """
+  The Docker CLI, aimed only at this Compose project: list its containers, run Elixir in an
+  app container, read logs, and pause the load generator. Anything that touches a container
+  first checks it's one of this project's running app containers.
+  """
+
+  alias Tour.Core.Containers
+  alias Tour.Core.Faults
+  alias Tour.Core.LogLine
+
+  @project "label=com.docker.compose.project=kev-check"
+
+  @doc "Every container in the kev-check project, running or not."
+  @spec stack() :: {:ok, [Containers.t()]} | {:error, String.t()}
+  def stack do
+    args = ["ps", "--all", "--filter", @project, "--format", "{{json .}}"]
+    with {:ok, output} <- Tour.Shell.run("docker", args), do: {:ok, Containers.parse(output)}
+  end
+
+  @doc "The app containers running right now, or none when Docker can't say."
+  @spec apps() :: [Containers.t()]
+  def apps do
+    case stack() do
+      {:ok, containers} -> Containers.running_apps(containers)
+      {:error, _reason} -> []
+    end
+  end
+
+  @doc "Evaluate one line of Elixir in a running app container, through the release's `rpc` command."
+  @spec rpc(String.t(), String.t()) :: Tour.Shell.result()
+  def rpc(name, code) do
+    with :ok <- guard(name),
+         do: Tour.Shell.run("docker", ["exec", name, "bin/kev_check", "rpc", code])
+  end
+
+  @doc "A container's fault knobs, now and at boot."
+  @spec faults(String.t()) :: {:ok, Faults.status()} | {:error, String.t()}
+  def faults(name) do
+    with {:ok, output} <- rpc(name, Faults.status_code()), do: Faults.parse(output)
+  end
+
+  @doc "Set a container's fault knobs."
+  @spec put_faults(String.t(), term(), term()) :: {:ok, Faults.status()} | {:error, String.t()}
+  def put_faults(name, latency_ms, error_rate) do
+    with {:ok, code} <- Faults.put_code(latency_ms, error_rate),
+         {:ok, output} <- rpc(name, code),
+         do: Faults.parse(output)
+  end
+
+  @doc "Put a container's fault knobs back to their boot values."
+  @spec reset_faults(String.t()) :: {:ok, Faults.status()} | {:error, String.t()}
+  def reset_faults(name) do
+    with {:ok, output} <- rpc(name, Faults.reset_code()), do: Faults.parse(output)
+  end
+
+  @doc "Reset every app container's knobs and unpause the load generator, one row per action."
+  @spec reset_all() :: [{String.t(), {:ok, term()} | {:error, String.t()}}]
+  def reset_all do
+    faults = Enum.map(apps(), &{&1.name, reset_faults(&1.name)})
+    faults ++ [{"load generator", running(loadgen(:unpause))}]
+  end
+
+  @doc "Crash a container's BEAM with exit code 1. Docker restarts it under the same name."
+  @spec crash(String.t()) :: :ok | {:error, String.t()}
+  def crash(name) do
+    with :ok <- guard(name) do
+      # The node dies mid-call, so rpc always reports a failure here.
+      _ = Tour.Shell.run("docker", ["exec", name, "bin/kev_check", "rpc", "System.halt(1)"])
+      :ok
+    end
+  end
+
+  @doc "The last `lines` log lines of a running app container."
+  @spec logs(String.t(), pos_integer()) :: Tour.Shell.result()
+  def logs(name, lines) do
+    with :ok <- guard(name),
+         do: Tour.Shell.run("docker", ["logs", "--tail", Integer.to_string(lines), name])
+  end
+
+  @doc "The container and log line carrying `request_id`. Logger writes just after the response, so this retries briefly."
+  @spec find_log(String.t() | nil) :: {:ok, String.t(), String.t()} | :error
+  def find_log(nil), do: :error
+
+  def find_log(request_id) do
+    Enum.find_value(1..5, :error, fn _try ->
+      case Enum.find_value(apps(), &log_match(&1.name, request_id)) do
+        nil ->
+          Process.sleep(200)
+          nil
+
+        found ->
+          found
+      end
+    end)
+  end
+
+  @doc "Freeze or thaw the load generator, so a measurement sees only the notebook's request."
+  @spec loadgen(:pause | :unpause) :: Tour.Shell.result()
+  def loadgen(action) when action in [:pause, :unpause],
+    do: Tour.Shell.run("docker", [Atom.to_string(action), "kev-check-loadgen-1"])
+
+  defp log_match(name, request_id) do
+    with {:ok, output} <- logs(name, 300),
+         {:ok, line} <- LogLine.find(output, request_id) do
+      {:ok, name, line}
+    else
+      _not_here -> nil
+    end
+  end
+
+  # Unpausing a load generator that wasn't paused is the outcome we wanted anyway.
+  defp running({:error, output}) do
+    if output =~ "is not paused", do: {:ok, "running"}, else: {:error, output}
+  end
+
+  defp running(result), do: result
+
+  defp guard(name) do
+    case Enum.find(apps(), &(&1.name == name)) do
+      nil -> {:error, "#{name} isn't a running kev-check app container, so I won't touch it."}
+      _container -> :ok
+    end
+  end
+end
+```
+
+`Tour.Prom` and `Tour.Alertmanager` call the two HTTP APIs. Errors come back as `{:error, message}`, so cells still render when the stack is down.
+
+```elixir
+defmodule Tour.Prom do
+  @moduledoc """
+  Prometheus's HTTP API: instant and range queries, alert rules, scrape targets, and how much
+  history it holds. Failures come back as sentences, never exceptions.
+  """
+
+  alias Tour.Core.PromJSON
+
+  @doc "Run an instant query now, or at the unix `:time` in `opts`."
+  @spec query(String.t(), keyword()) :: {:ok, [PromJSON.sample()]} | {:error, String.t()}
+  def query(expr, opts \\ []) do
+    with {:ok, data} <- get("/api/v1/query", [query: expr] ++ Keyword.take(opts, [:time])),
+         do: {:ok, PromJSON.vector(data)}
+  end
+
+  @doc "Run a range query over the last `minutes`, one point every `step` seconds."
+  @spec range(String.t(), pos_integer(), pos_integer()) ::
+          {:ok, [PromJSON.series()]} | {:error, String.t()}
+  def range(expr, minutes \\ 15, step \\ 15) do
+    now = System.os_time(:second)
+    params = [query: expr, start: now - minutes * 60, end: now, step: step]
+    with {:ok, data} <- get("/api/v1/query_range", params), do: {:ok, PromJSON.matrix(data)}
+  end
+
+  @doc "Every alerting rule, with its state and any active alerts."
+  @spec alert_rules() :: {:ok, [map()]} | {:error, String.t()}
+  def alert_rules do
+    with {:ok, %{"groups" => groups}} <- get("/api/v1/rules", type: "alert"),
+         do: {:ok, Enum.flat_map(groups, & &1["rules"])}
+  end
+
+  @doc "The targets Prometheus is scraping."
+  @spec targets() :: {:ok, [map()]} | {:error, String.t()}
+  def targets do
+    with {:ok, %{"activeTargets" => targets}} <- get("/api/v1/targets", state: "active"),
+         do: {:ok, targets}
+  end
+
+  @doc "Minutes between the oldest and newest sample in Prometheus's in-memory block."
+  @spec history_minutes() :: {:ok, non_neg_integer()} | {:error, String.t()}
+  def history_minutes do
+    with {:ok, %{"headStats" => %{"minTime" => first, "maxTime" => last}}} <-
+           get("/api/v1/status/tsdb", []),
+         do: {:ok, max(div(last - first, 60_000), 0)}
+  end
+
+  @doc "True when Prometheus says it's ready."
+  @spec ready?() :: boolean()
+  def ready?,
+    do:
+      match?(
+        {:ok, %{status: 200}},
+        Req.get(Tour.Config.prometheus_url() <> "/-/ready", retry: false)
+      )
+
+  defp get(path, params) do
+    url = Tour.Config.prometheus_url() <> path
+
+    case Req.get(url, params: params, retry: false, receive_timeout: 10_000) do
+      {:ok, %Req.Response{body: %{"status" => "success", "data" => data}}} ->
+        {:ok, data}
+
+      {:ok, %Req.Response{body: %{"error" => error}}} ->
+        {:error, "Prometheus refused the query: #{error}"}
+
+      {:ok, %Req.Response{status: status}} ->
+        {:error, "Prometheus answered HTTP #{status}."}
+
+      {:error, exception} ->
+        {:error, "Prometheus isn't answering at #{url}: #{Exception.message(exception)}"}
+    end
+  end
+end
+```
+
+```elixir
+defmodule Tour.Alertmanager do
+  @moduledoc """
+  Alertmanager's API: whether it's up, and the alerts it holds with the receiver each one
+  was routed to.
+  """
+
+  @doc "True when Alertmanager says it's ready."
+  @spec ready?() :: boolean()
+  def ready?,
+    do:
+      match?(
+        {:ok, %{status: 200}},
+        Req.get(Tour.Config.alertmanager_url() <> "/-/ready", retry: false)
+      )
+
+  @doc "The alerts Alertmanager holds, with their receivers and anything muting them."
+  @spec alerts() :: {:ok, [map()]} | {:error, String.t()}
+  def alerts do
+    case Req.get(Tour.Config.alertmanager_url() <> "/api/v2/alerts", retry: false) do
+      {:ok, %Req.Response{status: 200, body: alerts}} when is_list(alerts) ->
+        {:ok, alerts}
+
+      {:ok, %Req.Response{status: status}} ->
+        {:error, "Alertmanager answered HTTP #{status}."}
+
+      {:error, exception} ->
+        {:error, "Alertmanager isn't answering: #{Exception.message(exception)}"}
+    end
+  end
+end
+```
+
+`Tour.App` calls the app through the proxy on port 8080, or directly on one container's published port.
+
+```elixir
+defmodule Tour.App do
+  @moduledoc """
+  HTTP calls to KEV check: a lookup through the proxy or straight at one container, and one
+  container's `/metrics` page.
+  """
+
+  @type reply :: %{status: pos_integer(), body: term(), request_id: String.t() | nil, ms: float()}
+
+  @doc "Look up `id` through the proxy, or at `base` when given."
+  @spec lookup(String.t(), String.t()) :: {:ok, reply()} | {:error, String.t()}
+  def lookup(id, base \\ Tour.Config.app_url()) do
+    {micros, result} =
+      :timer.tc(fn ->
+        Req.get(base <> "/process", params: [id: id], retry: false, receive_timeout: 10_000)
+      end)
+
+    case result do
+      {:ok, %Req.Response{status: status, body: body} = response} ->
+        request_id = response |> Req.Response.get_header("x-request-id") |> List.first()
+        {:ok, %{status: status, body: body, request_id: request_id, ms: micros / 1000}}
+
+      {:error, exception} ->
+        {:error, "The app isn't answering at #{base}: #{Exception.message(exception)}"}
+    end
+  end
+
+  @doc "The base URL of one container's own API port, skipping the proxy."
+  @spec direct(Tour.Core.Containers.t()) :: String.t()
+  def direct(%{ports: %{4000 => port}}), do: "http://localhost:#{port}"
+
+  @doc "The Prometheus text one container serves on its metrics port."
+  @spec metrics(pos_integer() | nil) :: {:ok, String.t()} | {:error, String.t()}
+  def metrics(nil), do: {:error, "That container has no published metrics port."}
+
+  def metrics(port) do
+    case Req.get("http://localhost:#{port}/metrics", retry: false, receive_timeout: 5_000) do
+      {:ok, %Req.Response{status: 200, body: body}} -> {:ok, body}
+      {:ok, %Req.Response{status: status}} -> {:error, "/metrics answered HTTP #{status}."}
+      {:error, exception} -> {:error, "/metrics isn't answering: #{Exception.message(exception)}"}
+    end
+  end
+end
+```
+
+Display helpers. `Tour.UI` has status marks, Markdown tables, and Prometheus links. `Tour.Charts` builds chart specs. `Tour.Live` refreshes frames and charts every 5 seconds.
+
+````elixir
+defmodule Tour.UI do
+  @moduledoc """
+  Presentation helpers every section shares: status marks, Markdown tables, links into the
+  Prometheus UI, and drawing into frames so a failure shows up as a sentence.
+  """
+
+  @doc "A frame that shows `text` until something replaces it."
+  @spec frame(String.t()) :: Kino.Frame.t()
+  def frame(text \\ "") do
+    frame = Kino.Frame.new(placeholder: false)
+    Kino.Frame.render(frame, Kino.Markdown.new(text))
+    frame
+  end
+
+  @doc "Draw whatever `fun` returns into `frame`. An exception becomes a red note instead of a dead button."
+  @spec draw(Kino.Frame.t(), (-> term())) :: :ok
+  def draw(frame, fun) do
+    Kino.Frame.render(frame, fun.())
+  rescue
+    error -> Kino.Frame.render(frame, note(:error, Exception.message(error)))
+  end
+
+  @doc "Run a command and stream its output into `frame` like a terminal, ending with a status line."
+  @spec run_in(Kino.Frame.t(), String.t(), [String.t()]) :: Tour.Shell.result()
+  def run_in(frame, command, args) do
+    Kino.Frame.render(frame, Kino.Markdown.new("`$ #{Enum.join([command | args], " ")}`"))
+    append = &Kino.Frame.append(frame, Kino.Text.new(&1, terminal: true, chunk: true))
+    result = Tour.Shell.stream(command, args, append)
+    Kino.Frame.append(frame, finished(result))
+    result
+  end
+
+  @doc "Reset every app container and the load generator, and show where each one landed."
+  @spec reset_everything() :: Kino.Markdown.t()
+  def reset_everything do
+    rows = for {name, result} <- Tour.Docker.reset_all(), do: reset_row(name, result)
+    table(["", "Reset", "Now"], rows)
+  end
+
+  @doc "Several outputs, one under the other."
+  @spec stack([term()]) :: Kino.Layout.t()
+  def stack(items), do: Kino.Layout.grid(items, columns: 1)
+
+  @doc "A one-line note with a status mark."
+  @spec note(atom(), String.t()) :: Kino.Markdown.t()
+  def note(level, text), do: Kino.Markdown.new("#{mark(level)} #{text}")
+
+  @doc "The mark for a status or an alert state."
+  @spec mark(atom() | String.t()) :: String.t()
+  def mark(:ok), do: "✅"
+  def mark(:warn), do: "⚠️"
+  def mark(:error), do: "❌"
+  def mark(:info), do: "👉"
+  def mark("firing"), do: "🔥"
+  def mark("pending"), do: "🟡"
+  def mark(_inactive), do: "⚪"
+
+  @doc "A Markdown table from a header and rows of cells."
+  @spec table([String.t()], [[term()]]) :: Kino.Markdown.t()
+  def table(header, rows) do
+    divider = Enum.map(header, fn _column -> "---" end)
+    Kino.Markdown.new(Enum.map_join([header, divider | rows], "\n", &row/1))
+  end
+
+  @doc "A Markdown link that opens `expr` as a 15 minute graph in the Prometheus UI."
+  @spec prom_link(String.t(), String.t()) :: String.t()
+  def prom_link(expr, label \\ "Open in Prometheus") do
+    query = URI.encode_query([{"g0.expr", expr}, {"g0.tab", "graph"}, {"g0.range_input", "15m"}])
+    "[#{label} ↗](#{Tour.Config.prometheus_url()}/query?#{query})"
+  end
+
+  @doc "A PromQL query as a code block, with its Prometheus link under it."
+  @spec promql(String.t()) :: Kino.Markdown.t()
+  def promql(expr), do: Kino.Markdown.new("```promql\n#{expr}\n```\n\n#{prom_link(expr)}")
+
+  @doc "A JSON log line as a pretty-printed code block, keys in the order the app wrote them."
+  @spec json_block(String.t()) :: String.t()
+  def json_block(line) do
+    pretty =
+      case Jason.decode(line, objects: :ordered_objects) do
+        {:ok, decoded} -> Jason.encode!(decoded, pretty: true)
+        {:error, _not_json} -> line
+      end
+
+    "```json\n#{pretty}\n```"
+  end
+
+  @doc "Seconds as milliseconds, or what a missing number means."
+  @spec ms(term()) :: String.t()
+  def ms(seconds) when is_number(seconds) and seconds < 0.001,
+    do: "#{Float.round(seconds * 1000.0, 3)} ms"
+
+  def ms(seconds) when is_number(seconds), do: "#{Float.round(seconds * 1000.0, 1)} ms"
+  def ms(_other), do: "no data"
+
+  @doc "An integer with thousands separators, like 1,152,000."
+  @spec count(integer()) :: String.t()
+  def count(n) when is_integer(n) do
+    n
+    |> Integer.to_string()
+    |> String.reverse()
+    |> String.replace(~r/(\d{3})(?=\d)/, "\\1,")
+    |> String.reverse()
+  end
+
+  @doc "A ratio as a percent, or what a missing number means."
+  @spec percent(term()) :: String.t()
+  def percent(ratio) when is_number(ratio), do: "#{Float.round(ratio * 100.0, 2)}%"
+  def percent(:nan), do: "no traffic"
+  def percent(_other), do: "no data"
+
+  defp row(cells), do: "| " <> Enum.map_join(cells, " | ", &cell/1) <> " |"
+
+  defp cell(nil), do: ""
+
+  defp cell(value),
+    do: value |> to_string() |> String.replace("|", "\\|") |> String.replace("\n", " ")
+
+  defp reset_row(name, {:ok, %{current: settings}}),
+    do: [mark(:ok), name, Tour.Core.Faults.describe(settings)]
+
+  defp reset_row(name, {:ok, _output}), do: [mark(:ok), name, "running"]
+
+  defp reset_row(name, {:error, reason}),
+    do: [mark(:warn), name, reason |> String.split("\n", trim: true) |> List.first("")]
+
+  defp finished({:ok, _output}), do: note(:ok, "Done.")
+  defp finished({:error, _output}), do: note(:error, "That failed. The output above says why.")
+end
+````
+
+```elixir
+defmodule Tour.Charts do
+  @moduledoc """
+  VegaLite specs and rows for the live charts. Rows in, chart out, nothing fetched here.
+  """
+
+  alias VegaLite, as: Vl
+
+  @doc "Flatten range-query series into chart rows named by `name`, leaving out non-numbers."
+  @spec rows([Tour.Core.PromJSON.series()], (map() -> String.t())) :: [map()]
+  def rows(series, name), do: Enum.flat_map(series, &points(&1, name.(&1.labels)))
+
+  @doc "Rows that draw each `{label, value}` as a flat dashed line across the time `rows` cover."
+  @spec flat([map()], [{String.t(), number()}]) :: [map()]
+  def flat([], _thresholds), do: []
+
+  def flat(rows, thresholds) do
+    {first, last} = rows |> Enum.map(& &1.time) |> Enum.min_max()
+
+    for {label, value} <- thresholds,
+        time <- [first, last],
+        do: %{time: time, value: value, series: label, kind: "threshold"}
+  end
+
+  @doc "An empty line chart, one line per `series`, ready for rows to be pushed in."
+  @spec lines(String.t(), keyword()) :: VegaLite.t()
+  def lines(title, opts \\ []) do
+    Vl.new(width: Keyword.get(opts, :width, 330), height: 200, title: title)
+    |> Vl.mark(:line, interpolate: "monotone")
+    |> Vl.encode_field(:x, "time", type: :temporal, title: nil)
+    |> Vl.encode_field(:y, "value", type: :quantitative, title: Keyword.get(opts, :unit, ""))
+    |> Vl.encode_field(:color, "series",
+      type: :nominal,
+      title: nil,
+      legend: [orient: "bottom", columns: 3]
+    )
+    |> Vl.encode_field(:stroke_dash, "kind", type: :nominal, legend: nil)
+  end
+
+  defp points(%{points: points}, series) do
+    for {time, value} <- points,
+        is_number(value),
+        do: %{time: time * 1000, value: value, series: series, kind: "data"}
+  end
+end
+```
+
+```elixir
+defmodule Tour.Live do
+  @moduledoc """
+  Live panels: frames and charts that refresh every 5 seconds while the notebook is open.
+  """
+
+  @every_ms 5_000
+
+  @doc "A frame that draws `draw.()` now and again every 5 seconds."
+  @spec panel((-> term())) :: Kino.Frame.t()
+  def panel(draw) do
+    frame = Kino.Frame.new(placeholder: false)
+    Tour.UI.draw(frame, draw)
+    Kino.listen(@every_ms, fn _tick -> Tour.UI.draw(frame, draw) end)
+    frame
+  end
+
+  @doc """
+  A live line chart of `{name, expr}` range queries over the last 15 minutes. A name like
+  `"{pod}"` takes each series' `pod` label, and each `{label, value}` in `:thresholds`
+  draws as a dashed line. The chart is empty while Prometheus is down.
+  """
+  @spec chart(String.t(), [{String.t(), String.t()}], keyword()) :: Kino.VegaLite.t()
+  def chart(title, queries, opts \\ []) do
+    chart = Kino.VegaLite.new(Tour.Charts.lines(title, opts))
+    thresholds = Keyword.get(opts, :thresholds, [])
+    refresh(chart, queries, thresholds)
+    Kino.listen(@every_ms, fn _tick -> refresh(chart, queries, thresholds) end)
+    chart
+  end
+
+  # A push whose window equals its own length replaces all the data in one step, so the chart
+  # never blanks between updates. Live charts stay out of frames: inside one, Livebook can
+  # grow them without limit.
+  defp refresh(chart, queries, thresholds) do
+    rows =
+      case fetch(queries) do
+        {:ok, rows} -> rows ++ Tour.Charts.flat(rows, thresholds)
+        {:error, _down} -> []
+      end
+
+    Kino.VegaLite.push_many(chart, rows, window: length(rows))
+  end
+
+  defp fetch(queries) do
+    Enum.reduce_while(queries, {:ok, []}, fn {name, expr}, {:ok, rows} ->
+      case Tour.Prom.range(expr) do
+        {:ok, series} -> {:cont, {:ok, rows ++ Tour.Charts.rows(series, &label(name, &1))}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  # "{pod}" becomes "app-1": every container name starts with the project's.
+  defp label(name, labels) do
+    Regex.replace(~r/\{(\w+)\}/, name, fn _whole, key ->
+      labels |> Map.get(key, "") |> String.replace_prefix("kev-check-", "")
+    end)
+  end
+end
+```
+
+## Control room: run the stack from here
+
+Each button runs a `make` target from the repo. The container table refreshes every 5 seconds, and command output appears below it.
+
+| Button        | Runs            | What it does                                                                                                                                                                                  |
+| ------------- | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ▶ Start     | `make up`       | Builds the image and starts two app containers, the nginx proxy on :8080, Prometheus on :9090, Alertmanager on :9093, and a load generator. About 20 seconds once the base images are pulled. |
+| ■ Stop      | `make down`     | Stops and removes the containers, keeping Prometheus's history.                                                                                                                               |
+| Reset faults  |                 | Puts every container's fault knobs back to their boot values and unpauses the load generator.                                                                                                 |
+| Rebuild app   | `make redeploy` | Rebuilds the image and recreates the app containers, for a code change.                                                                                                                       |
+| Reload rules  | `make reload`   | Checks the config and runs the rule tests, then reloads Prometheus and Alertmanager.                                                                                                          |
+| Run tests     | `make check`    | Runs the formatter, the compiler, Credo, the tests, and Dialyzer inside Docker. A few minutes the first time.                                                                                 |
+| Create .env   |                 | Adds a random `SECRET_KEY_BASE` to `.env` if it doesn't set one. Compose reads `.env` on every command.                                                                                       |
+| Scale         | `make scale`    | Changes how many app containers run. Prometheus finds new ones through the Docker socket within seconds.                                                                                      |
+| Stop and wipe | `make clean`    | Like Stop, and deletes Prometheus's history, which empties the 1 hour alert windows. Requires the checkbox.                                                                                   |
+
+```elixir
+buttons = [
+  start: Kino.Control.button("▶ Start"),
+  down: Kino.Control.button("■ Stop"),
+  reset: Kino.Control.button("Reset faults"),
+  redeploy: Kino.Control.button("Rebuild app"),
+  reload: Kino.Control.button("Reload rules"),
+  check: Kino.Control.button("Run tests"),
+  env: Kino.Control.button("Create .env")
+]
+
+scale =
+  Kino.Control.form(
+    [
+      n:
+        Kino.Input.select("App containers", Enum.map(1..5, &{&1, Integer.to_string(&1)}),
+          default: 2
+        )
+    ],
+    submit: "Scale"
+  )
+
+wipe =
+  Kino.Control.form([sure: Kino.Input.checkbox("Also delete Prometheus's history")],
+    submit: "Stop and wipe"
+  )
+
+output = Tour.UI.frame("The last command's output shows up here.")
+
+secret = fn ->
+  case Tour.Config.secret?() do
+    true -> Tour.UI.note(:ok, "`SECRET_KEY_BASE` is set in `.env`.")
+    false -> Tour.UI.note(:error, "`.env` has no `SECRET_KEY_BASE` yet. Press Create .env.")
+  end
+end
+
+board = fn ->
+  case Tour.Docker.stack() do
+    {:ok, []} ->
+      Tour.UI.stack([secret.(), Tour.UI.note(:info, "Nothing is running. Press Start.")])
+
+    {:ok, containers} ->
+      rows =
+        Enum.map(containers, &[&1.service, &1.name, &1.status, &1.ports[4000], &1.ports[9568]])
+
+      Tour.UI.stack([
+        secret.(),
+        Tour.UI.table(["Service", "Container", "Status", "API", "Metrics"], rows)
+      ])
+
+    {:error, reason} ->
+      Tour.UI.note(:error, reason)
+  end
+end
+
+env_note = fn
+  {:ok, message} -> Tour.UI.note(:ok, message)
+  {:error, message} -> Tour.UI.note(:warn, message)
+end
+
+Kino.listen(Kino.Control.tagged_stream([scale: scale, wipe: wipe] ++ buttons), fn
+  {:start, _click} -> Tour.UI.run_in(output, "make", ["up"])
+  {:down, _click} -> Tour.UI.run_in(output, "make", ["down"])
+  {:reset, _click} -> Tour.UI.draw(output, &Tour.UI.reset_everything/0)
+  {:redeploy, _click} -> Tour.UI.run_in(output, "make", ["redeploy"])
+  {:reload, _click} -> Tour.UI.run_in(output, "make", ["reload"])
+  {:check, _click} -> Tour.UI.run_in(output, "make", ["check"])
+  {:env, _click} -> Tour.UI.draw(output, fn -> env_note.(Tour.Config.create_env()) end)
+  {:scale, %{data: %{n: n}}} -> Tour.UI.run_in(output, "make", ["scale", "N=#{n}"])
+  {:wipe, %{data: %{sure: true}}} -> Tour.UI.run_in(output, "make", ["clean"])
+  {:wipe, _unsure} -> Kino.Frame.render(output, Tour.UI.note(:warn, "Tick the box first."))
+end)
+
+links =
+  Kino.Markdown.new(
+    "[App ↗](http://localhost:8080/process?id=CVE-2021-44228) · " <>
+      "[Prometheus ↗](http://localhost:9090/targets) · [Alertmanager ↗](http://localhost:9093)"
+  )
+
+Tour.UI.stack([
+  links,
+  Kino.Layout.grid(Keyword.values(buttons), columns: 4),
+  Kino.Layout.grid([scale, wipe], columns: 2),
+  Tour.Live.panel(board),
+  output
+])
+```
+
+## Preflight: is everything ready?
+
+Checks Docker, the secret, the containers, Prometheus, Alertmanager, the app, how much history Prometheus has, and the fault settings. Run it after Start.
+
+`Tour.Core.Preflight` turns the gathered facts into checks. `Tour.Preflight` gathers them.
+
+```elixir
+defmodule Tour.Core.Preflight do
+  @moduledoc """
+  Turns what the preflight gathered into checks marked ok, warn, or error, each with a
+  sentence saying what's true or what to do about it.
+  """
+
+  @type level :: :ok | :warn | :error
+  @type check :: %{name: String.t(), level: level(), detail: String.t()}
+
+  @services ~w(app proxy prometheus alertmanager loadgen)
+
+  @doc "Every check, in the order a person would fix them."
+  @spec checks(map()) :: [check()]
+  def checks(facts) do
+    [
+      docker(facts.docker),
+      checkout(facts.repo, facts.repo_path),
+      secret(facts.secret),
+      containers(facts.stack),
+      prometheus(facts.prometheus),
+      targets(facts.targets),
+      rules(facts.rules),
+      alertmanager(facts.alertmanager),
+      app(facts.lookup),
+      history(facts.history),
+      faults(facts.faults)
+    ]
+  end
+
+  defp docker({:ok, version}),
+    do: check("Docker", :ok, "Engine #{String.trim(version)} is running.")
+
+  defp docker({:error, reason}),
+    do: check("Docker", :error, "#{first_line(reason)} Start Docker Desktop.")
+
+  defp checkout(true, path), do: check("Checkout", :ok, "Found `compose.yaml` in `#{path}`.")
+
+  defp checkout(false, path),
+    do:
+      check(
+        "Checkout",
+        :error,
+        "No `compose.yaml` in `#{path}`. Set `KEV_CHECK_DIR` and rerun the Toolbox."
+      )
+
+  defp secret(true), do: check("Secret", :ok, "`SECRET_KEY_BASE` is set in `.env`.")
+
+  defp secret(false),
+    do:
+      check(
+        "Secret",
+        :error,
+        "`.env` has no `SECRET_KEY_BASE`. Press Create .env in the Control room."
+      )
+
+  defp containers({:ok, containers}) do
+    running = for %{state: "running", service: service} <- containers, do: service
+    paused = for %{state: "paused", service: service} <- containers, do: service
+    apps = Enum.count(running, &(&1 == "app"))
+
+    case {@services -- (running ++ paused), paused} do
+      {[], []} ->
+        check(
+          "Containers",
+          :ok,
+          "#{apps} app containers, the proxy, Prometheus, Alertmanager, and the load generator."
+        )
+
+      {[], paused} ->
+        check(
+          "Containers",
+          :warn,
+          "Paused: #{Enum.join(paused, ", ")}. Reset in the Control room unpauses it."
+        )
+
+      {missing, _paused} ->
+        check(
+          "Containers",
+          :error,
+          "Not running: #{Enum.join(missing, ", ")}. Press Start in the Control room."
+        )
+    end
+  end
+
+  defp containers({:error, reason}), do: check("Containers", :error, first_line(reason))
+
+  defp prometheus(true), do: check("Prometheus", :ok, "Ready on localhost:9090.")
+  defp prometheus(false), do: check("Prometheus", :error, "Not answering on localhost:9090.")
+
+  defp targets({:ok, targets}) do
+    apps = Enum.filter(targets, &(get_in(&1, ["labels", "job"]) == "kev-check"))
+
+    case {Enum.count(apps, &(&1["health"] == "up")), length(apps)} do
+      {0, 0} ->
+        check("Scrape targets", :error, "Prometheus hasn't found an app container yet.")
+
+      {all, all} ->
+        check("Scrape targets", :ok, "#{all} of #{all} app containers scraped and up.")
+
+      {up, total} ->
+        check(
+          "Scrape targets",
+          :warn,
+          "#{up} of #{total} up. A restarted container is back after one 15 second scrape."
+        )
+    end
+  end
+
+  defp targets({:error, reason}), do: check("Scrape targets", :error, reason)
+
+  defp rules({:ok, rules}), do: check("Alert rules", :ok, "#{length(rules)} alert rules loaded.")
+  defp rules({:error, reason}), do: check("Alert rules", :error, reason)
+
+  defp alertmanager(true), do: check("Alertmanager", :ok, "Ready on localhost:9093.")
+  defp alertmanager(false), do: check("Alertmanager", :error, "Not answering on localhost:9093.")
+
+  defp app({:ok, %{status: 200, body: %{"catalog_version" => version}}}),
+    do: check("App", :ok, "Answers through the proxy on :8080, serving catalog #{version}.")
+
+  defp app({:ok, %{status: status}}),
+    do: check("App", :error, "The proxy answered HTTP #{status}.")
+
+  defp app({:error, reason}), do: check("App", :error, reason)
+
+  defp history({:ok, minutes}) when minutes >= 60,
+    do: check("History", :ok, "#{minutes} minutes of data, enough for the 1 hour alert windows.")
+
+  defp history({:ok, minutes}) when minutes >= 15,
+    do:
+      check(
+        "History",
+        :warn,
+        "#{minutes} minutes so far. Charts look full; the 1 hour alert windows fill at 60."
+      )
+
+  defp history({:ok, minutes}),
+    do:
+      check(
+        "History",
+        :warn,
+        "Only #{minutes} minutes so far. Charts look full after 15, alert windows after 60."
+      )
+
+  defp history({:error, reason}), do: check("History", :error, reason)
+
+  defp faults([]), do: check("Faults", :warn, "No app container to ask.")
+
+  defp faults(results) do
+    case Enum.reject(results, &boot?/1) do
+      [] ->
+        check("Faults", :ok, "Every app container is on its boot values.")
+
+      changed ->
+        check(
+          "Faults",
+          :warn,
+          "Not on boot values: #{Enum.map_join(changed, ", ", &describe/1)}. Reset in the Control room."
+        )
+    end
+  end
+
+  defp boot?({_name, {:ok, %{current: same, boot: same}}}), do: true
+  defp boot?(_changed), do: false
+
+  defp describe({name, {:ok, %{current: settings}}}),
+    do: "#{name} (#{Tour.Core.Faults.describe(settings)})"
+
+  defp describe({name, {:error, _reason}}), do: "#{name} (didn't answer)"
+
+  defp check(name, level, detail), do: %{name: name, level: level, detail: detail}
+
+  defp first_line(text), do: text |> String.split("\n", trim: true) |> List.first("")
+end
+```
+
+```elixir
+defmodule Tour.PreflightTest do
+  use ExUnit.Case, async: true
+
+  alias Tour.Core.Preflight
+
+  @down %{
+    docker: {:error, "Cannot connect to the Docker daemon at unix:///var/run/docker.sock.\n"},
+    repo: true,
+    repo_path: "/repo",
+    secret: false,
+    stack: {:error, "Cannot connect to the Docker daemon"},
+    prometheus: false,
+    targets: {:error, "Prometheus isn't answering"},
+    rules: {:error, "Prometheus isn't answering"},
+    alertmanager: false,
+    lookup: {:error, "The app isn't answering"},
+    history: {:error, "Prometheus isn't answering"},
+    faults: []
+  }
+
+  test "with everything down, every check says so in a sentence" do
+    checks = Preflight.checks(@down)
+    assert length(checks) == 11
+    assert Enum.all?(checks, &(&1.level in [:error, :warn] or &1.name == "Checkout"))
+    assert Enum.all?(checks, &(is_binary(&1.detail) and &1.detail != ""))
+  end
+
+  test "a paused load generator is a warning, and a leftover fault names its container" do
+    containers =
+      for {service, state} <- [
+            {"app", "running"},
+            {"proxy", "running"},
+            {"prometheus", "running"},
+            {"alertmanager", "running"},
+            {"loadgen", "paused"}
+          ],
+          do: %{service: service, state: state}
+
+    leftover =
+      {"kev-check-app-1",
+       {:ok,
+        %{current: %{latency_ms: 400, error_rate: 0.2}, boot: %{latency_ms: 25, error_rate: 0.0}}}}
+
+    checks =
+      Map.new(
+        Preflight.checks(%{@down | stack: {:ok, containers}, faults: [leftover]}),
+        &{&1.name, &1}
+      )
+
+    assert %{level: :warn, detail: "Paused: loadgen" <> _rest} = checks["Containers"]
+    assert checks["Faults"].detail =~ "kev-check-app-1 (up to 400 ms, 20% errors)"
+  end
+end
+
+ExUnit.run()
+```
+
+```elixir
+defmodule Tour.Preflight do
+  @moduledoc """
+  Asks Docker, Prometheus, Alertmanager, and the app how they're doing, then shows the
+  verdicts as one table. Every probe fails soft, so this works with the stack down.
+  """
+
+  alias Tour.Core.Containers
+
+  @doc "Every fact the checks need."
+  @spec gather() :: map()
+  def gather do
+    stack = Tour.Docker.stack()
+
+    %{
+      docker: Tour.Shell.run("docker", ["version", "--format", "{{.Server.Version}}"]),
+      repo: File.exists?(Path.join(Tour.Config.repo(), "compose.yaml")),
+      repo_path: Tour.Config.repo(),
+      secret: Tour.Config.secret?(),
+      stack: stack,
+      prometheus: Tour.Prom.ready?(),
+      targets: Tour.Prom.targets(),
+      rules: Tour.Prom.alert_rules(),
+      alertmanager: Tour.Alertmanager.ready?(),
+      lookup: Tour.App.lookup("CVE-2021-44228"),
+      history: Tour.Prom.history_minutes(),
+      faults: stack |> running_apps() |> Enum.map(&{&1.name, Tour.Docker.faults(&1.name)})
+    }
+  end
+
+  @doc "The checks as a table."
+  @spec board() :: Kino.Markdown.t()
+  def board do
+    rows =
+      for check <- Tour.Core.Preflight.checks(gather()),
+          do: [Tour.UI.mark(check.level), check.name, check.detail]
+
+    Tour.UI.table(["", "Check", "What I found"], rows)
+  end
+
+  defp running_apps({:ok, containers}), do: Containers.running_apps(containers)
+  defp running_apps({:error, _reason}), do: []
+end
+```
+
+```elixir
+again = Kino.Control.button("Run the preflight again")
+preflight = Tour.UI.frame()
+Tour.UI.draw(preflight, &Tour.Preflight.board/0)
+Kino.listen(again, fn _click -> Tour.UI.draw(preflight, &Tour.Preflight.board/0) end)
+Tour.UI.stack([again, preflight])
+```
+
+## 1. The question KEV check answers
+
+CISA's Known Exploited Vulnerabilities catalog lists about 1,700 CVEs known to be exploited. `GET /process?id=` says whether an ID is on it and, if so, returns the vendor, product, and patch due date. An ID that isn't listed is a successful answer. Invalid input or a missing catalog is an error.
+
+Errors are counted by the app's reason, not the HTTP status: `123` returns 400 and increments `kev_process_errors_total{reason="invalid_format"}`.
+
+```elixir
+presets = [
+  {"Log4Shell", "CVE-2021-44228"},
+  {"Messy but valid", "  cve-2023-4966 "},
+  {"Not on the list", "CVE-2023-99999"},
+  {"Not a CVE", "123"},
+  {"From the future", "CVE-2099-0001"},
+  {"Empty", ""}
+]
+
+look_up =
+  Kino.Control.form([id: Kino.Input.text("CVE ID", default: "CVE-2021-44228")], submit: "Look up")
+
+preset_buttons = Enum.map(presets, fn {label, value} -> {Kino.Control.button(label), value} end)
+answer = Tour.UI.frame("Pick a preset or type an ID, then press Look up.")
+
+headline = fn
+  %{status: 200, body: %{"known_exploited" => true} = body} ->
+    ransomware = if body["known_ransomware_use"], do: "yes", else: "not known"
+
+    """
+    🚨 **#{body["cve_id"]} is on the KEV list.** #{body["vendor"]} #{body["product"]}: #{body["name"]}.
+
+    Added #{body["date_added"]}, due #{body["due_date"]}. Used in ransomware: #{ransomware}. CISA says: #{body["required_action"]}
+    """
+
+  %{status: 200, body: body} ->
+    "🟢 **#{body["cve_id"]} isn't on the list**, as of catalog #{body["catalog_version"]}. Counted as a success."
+
+  %{status: status, body: %{"error" => error, "message" => message}} ->
+    "⛔ **HTTP #{status}, `#{error}`.** #{message} The errors counter records `reason=\"#{error}\"`."
+
+  %{status: status, body: body} ->
+    "**HTTP #{status}** #{inspect(body)}"
+end
+
+show = fn value ->
+  Tour.UI.draw(answer, fn ->
+    case Tour.App.lookup(value) do
+      {:ok, reply} ->
+        meta =
+          "`GET /process?id=#{value}` · #{Float.round(reply.ms, 1)} ms · request `#{reply.request_id}`"
+
+        Tour.UI.stack([
+          Kino.Markdown.new(headline.(reply) <> "\n\n" <> meta),
+          Kino.Tree.new(reply.body)
+        ])
+
+      {:error, reason} ->
+        Tour.UI.note(:error, reason)
+    end
+  end)
+end
+
+Kino.listen(look_up, fn %{data: %{id: value}} -> show.(value) end)
+
+Enum.each(preset_buttons, fn {button, value} ->
+  Kino.listen(button, fn _click -> show.(value) end)
+end)
+
+Tour.UI.stack([
+  look_up,
+  Kino.Layout.grid(for({button, _value} <- preset_buttons, do: button), columns: 3),
+  answer
+])
+```
+
+## 2. One request, five signals
+
+The app has five instrumentation points: a latency histogram, a success counter, an errors counter, a gauge, and a log line.
+
+One telemetry span wraps each lookup (`lib/kev_check/lookup.ex`), and its stop event feeds the histogram, both counters, and the log line. The experiment below pauses the load generator, reads one container's `/metrics`, sends that container one lookup, reads `/metrics` again, and shows which series changed, with the lookup's log line.
+
+`Tour.Core.Exposition` parses the Prometheus text format and diffs two scrapes.
+
+```elixir
+defmodule Tour.Core.Exposition do
+  @moduledoc """
+  Reads the Prometheus text format an app serves on `/metrics`, and compares two reads to
+  show which series moved.
+  """
+
+  alias Tour.Core.PromJSON
+
+  @type t :: %{
+          samples: %{String.t() => PromJSON.value()},
+          types: %{String.t() => String.t()},
+          help: %{String.t() => String.t()}
+        }
+  @type change :: %{
+          series: String.t(),
+          family: String.t(),
+          type: String.t() | nil,
+          before: PromJSON.value() | nil,
+          after: PromJSON.value() | nil
+        }
+
+  @sample ~r/^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*\})?\s+(\S+)/
+
+  @doc "Parse a `/metrics` page into its samples, types, and help texts."
+  @spec parse(String.t()) :: t()
+  def parse(text) do
+    text
+    |> String.split("\n", trim: true)
+    |> Enum.reduce(%{samples: %{}, types: %{}, help: %{}}, &read_line/2)
+  end
+
+  @doc "The metric families a page declares, from its own `# HELP` and `# TYPE` lines."
+  @spec catalog(t()) :: [%{name: String.t(), type: String.t(), help: String.t()}]
+  def catalog(%{types: types, help: help}) do
+    types
+    |> Enum.map(fn {name, type} -> %{name: name, type: type, help: Map.get(help, name, "")} end)
+    |> Enum.sort_by(& &1.name)
+  end
+
+  @doc "Every series whose value differs between two reads of the same page."
+  @spec diff(t(), t()) :: [change()]
+  def diff(%{samples: before}, %{samples: later, types: types}) do
+    (Map.keys(before) ++ Map.keys(later))
+    |> Enum.uniq()
+    |> Enum.reject(&(Map.get(before, &1) == Map.get(later, &1)))
+    |> Enum.sort()
+    |> Enum.map(&change(&1, before, later, types))
+  end
+
+  @doc "The values one label takes on one metric, like every `reason` the errors counter has."
+  @spec label_values(t(), String.t(), String.t()) :: [String.t()]
+  def label_values(%{samples: samples}, metric, label) do
+    pattern = ~r/^#{Regex.escape(metric)}\{.*#{Regex.escape(label)}="([^"]*)"/
+
+    samples
+    |> Map.keys()
+    |> Enum.flat_map(&(Regex.run(pattern, &1, capture: :all_but_first) || []))
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  @doc "A histogram bucket's upper edge in seconds, `:inf` for the last one, nil for other series."
+  @spec le(String.t()) :: float() | :inf | nil
+  def le(series) do
+    case Regex.run(~r/le="([^"]+)"/, series, capture: :all_but_first) do
+      [edge] -> PromJSON.value(edge)
+      nil -> nil
+    end
+  end
+
+  defp read_line("# HELP " <> rest, acc), do: put_meta(acc, :help, rest)
+  defp read_line("# TYPE " <> rest, acc), do: put_meta(acc, :types, rest)
+  defp read_line("#" <> _comment, acc), do: acc
+
+  defp read_line(line, acc) do
+    case Regex.run(@sample, line, capture: :all_but_first) do
+      [name, labels, value] -> put_in(acc, [:samples, name <> labels], PromJSON.value(value))
+      _not_a_sample -> acc
+    end
+  end
+
+  defp put_meta(acc, key, rest) do
+    case String.split(rest, " ", parts: 2) do
+      [name, text] -> put_in(acc, [key, name], text)
+      [name] -> put_in(acc, [key, name], "")
+    end
+  end
+
+  defp change(series, before, later, types) do
+    family = family(series, types)
+
+    %{
+      series: series,
+      family: family,
+      type: Map.get(types, family),
+      before: Map.get(before, series),
+      after: Map.get(later, series)
+    }
+  end
+
+  # `x_bucket`, `x_sum`, and `x_count` all belong to histogram `x`.
+  defp family(series, types) do
+    name = series |> String.split("{") |> hd()
+    base = String.replace(name, ~r/_(bucket|sum|count)$/, "")
+    if Map.get(types, base) in ["histogram", "summary"], do: base, else: name
+  end
+end
+```
+
+```elixir
+defmodule Tour.ExpositionTest do
+  use ExUnit.Case, async: true
+
+  alias Tour.Core.Exposition
+
+  @before """
+  # HELP kev_process_duration_seconds Time to answer one /process lookup.
+  # TYPE kev_process_duration_seconds histogram
+  kev_process_duration_seconds_bucket{le="0.01"} 4
+  kev_process_duration_seconds_bucket{le="0.025"} 9
+  kev_process_duration_seconds_bucket{le="+Inf"} 10
+  kev_process_duration_seconds_sum 0.2
+  kev_process_duration_seconds_count 10
+  # TYPE kev_process_errors_total counter
+  kev_process_errors_total{reason="invalid_format"} 3
+  # TYPE kev_catalog_age_seconds gauge
+  kev_catalog_age_seconds 100
+  """
+
+  test "the catalog comes from the page's own TYPE and HELP lines" do
+    assert [
+             %{name: "kev_catalog_age_seconds", type: "gauge"},
+             %{
+               name: "kev_process_duration_seconds",
+               type: "histogram",
+               help: "Time to answer one /process lookup."
+             },
+             %{name: "kev_process_errors_total", type: "counter"}
+           ] = Exposition.catalog(Exposition.parse(@before))
+  end
+
+  test "a 20 ms lookup moves every bucket from 25 ms up, plus _sum and _count, and nothing else" do
+    later =
+      @before
+      |> String.replace(~s(le="0.025"} 9), ~s(le="0.025"} 10))
+      |> String.replace(~s(le="+Inf"} 10), ~s(le="+Inf"} 11))
+      |> String.replace("_sum 0.2", "_sum 0.22")
+      |> String.replace("_count 10", "_count 11")
+
+    changes = Exposition.diff(Exposition.parse(@before), Exposition.parse(later))
+
+    assert Enum.map(changes, & &1.series) == [
+             ~s(kev_process_duration_seconds_bucket{le="+Inf"}),
+             ~s(kev_process_duration_seconds_bucket{le="0.025"}),
+             "kev_process_duration_seconds_count",
+             "kev_process_duration_seconds_sum"
+           ]
+
+    assert Enum.all?(
+             changes,
+             &(&1.family == "kev_process_duration_seconds" and &1.type == "histogram")
+           )
+  end
+
+  test "label values and bucket edges come out of series names" do
+    parsed = Exposition.parse(@before)
+
+    assert Exposition.label_values(parsed, "kev_process_errors_total", "reason") == [
+             "invalid_format"
+           ]
+
+    assert Exposition.le(~s(x_bucket{le="0.025"})) == 0.025
+    assert Exposition.le(~s(x_bucket{le="+Inf"})) == :inf
+    assert Exposition.le("x_count") == nil
+  end
+end
+
+ExUnit.run()
+```
+
+`Tour.OneRequest` runs the experiment. Its `after` block unpauses the load generator even if a step fails. `Tour.Signals` renders the result.
+
+```elixir
+defmodule Tour.OneRequest do
+  @moduledoc """
+  Section 2's experiment: pause the load generator, read one container's metrics, send it
+  one lookup, read them again, and find the lookup's log line.
+  """
+
+  alias Tour.Core.Exposition
+
+  @type result :: %{
+          id: String.t(),
+          container: String.t(),
+          reply: Tour.App.reply(),
+          changes: [Exposition.change()],
+          log_line: String.t() | nil,
+          paused?: boolean()
+        }
+
+  @doc "Send `id` straight to the first app container and report every series that moved."
+  @spec run(String.t()) :: {:ok, result()} | {:error, String.t()}
+  def run(id) do
+    case Tour.Docker.apps() do
+      [container | _others] -> paused(fn -> measure(container, id) end)
+      [] -> {:error, "No app container is running. Press Start in the Control room."}
+    end
+  end
+
+  # The pause stops new lookups. The second lets the ones already inside the app finish.
+  defp paused(fun) do
+    paused? = match?({:ok, _output}, Tour.Docker.loadgen(:pause))
+    Process.sleep(1_000)
+    with {:ok, result} <- fun.(), do: {:ok, Map.put(result, :paused?, paused?)}
+  after
+    Tour.Docker.loadgen(:unpause)
+  end
+
+  defp measure(container, id) do
+    with {:ok, before} <- Tour.App.metrics(container.ports[9568]),
+         {:ok, reply} <- Tour.App.lookup(id, Tour.App.direct(container)),
+         {:ok, later} <- Tour.App.metrics(container.ports[9568]) do
+      {:ok,
+       %{
+         id: id,
+         container: container.name,
+         reply: reply,
+         changes: Exposition.diff(Exposition.parse(before), Exposition.parse(later)),
+         log_line: log_line(reply.request_id)
+       }}
+    end
+  end
+
+  defp log_line(request_id) do
+    case Tour.Docker.find_log(request_id) do
+      {:ok, _container, line} -> line
+      :error -> nil
+    end
+  end
+end
+```
+
+```elixir
+defmodule Tour.Signals do
+  @moduledoc """
+  Turns section 2's experiment into one card per instrumentation point, built from the
+  series that actually moved.
+  """
+
+  alias Tour.Core.Exposition
+
+  @histogram "kev_process_duration_seconds"
+
+  @doc "A summary, then a card each for the histogram, both counters, the HTTP counter, the gauges, and the log line."
+  @spec cards(Tour.OneRequest.result()) :: Kino.Layout.t()
+  def cards(%{changes: changes} = result) do
+    families = Enum.group_by(changes, & &1.family)
+
+    middle = [
+      counter("✅ Success counter", "kev_process_success_total", families),
+      counter("⛔ Errors counter", "kev_process_errors_total", families),
+      counter("🌐 HTTP requests", "http_requests_total", families),
+      gauges(Enum.filter(changes, &(&1.type == "gauge")))
+    ]
+
+    Tour.UI.stack([
+      Kino.Markdown.new(summary(result)),
+      card(histogram(Map.get(families, @histogram, []))),
+      Kino.Layout.grid(Enum.map(middle, &card/1), columns: 2),
+      card(log(result.log_line))
+    ])
+  end
+
+  defp summary(%{id: id, container: container, reply: reply, paused?: paused?}) do
+    paused = if paused?, do: "paused", else: "not paused, so other lookups may show up too"
+
+    "Sent `#{id}` straight to `#{container}`: HTTP #{reply.status} in #{Float.round(reply.ms, 1)} ms, " <>
+      "request `#{reply.request_id}`. Load generator #{paused}."
+  end
+
+  defp card(markdown), do: Kino.Layout.grid([Kino.Markdown.new(markdown)], boxed: true)
+
+  defp histogram([]), do: "#### 📊 Histogram\n`#{@histogram}` didn't move."
+
+  defp histogram(changes) do
+    edges =
+      changes
+      |> Enum.map(&Exposition.le(&1.series))
+      |> Enum.reject(&is_nil/1)
+      |> Enum.sort_by(&edge_order/1)
+      |> Enum.map_join(" ", &"`#{edge_label(&1)}`")
+
+    took =
+      case Enum.find(changes, &(&1.series == @histogram <> "_sum")) do
+        %{before: before, after: later} -> Tour.UI.ms(later - before)
+        nil -> "no data"
+      end
+
+    """
+    #### 📊 Histogram, `#{@histogram}`
+
+    The lookup took **#{took}**. Buckets that went up by 1: #{edges}
+
+    Each bucket counts every lookup at or under its edge, so one lookup lands in every bucket from its own edge up to `+Inf`. `_count` went up by 1, and `_sum` by the duration.
+    """
+  end
+
+  defp counter(title, family, families) do
+    case Map.get(families, family, []) do
+      [] ->
+        "#### #{title}\n`#{family}` didn't move."
+
+      changes ->
+        "#### #{title}\n`#{family}`\n\n" <>
+          Enum.map_join(changes, "\n\n", &"`#{labels(&1, family)}` **+#{delta(&1)}**")
+    end
+  end
+
+  defp gauges([]),
+    do: """
+    #### 🌡️ Gauges
+    `kev_catalog_age_seconds` didn't move. A gauge records state (the catalog's age), not events, so a lookup doesn't change it.
+    """
+
+  defp gauges(changes) do
+    """
+    #### 🌡️ Gauges
+    #{Enum.map_join(changes, "\n\n", &"`#{&1.series}` #{&1.before} → #{&1.after}")}
+
+    These change on a 10 second timer, not because of the lookup.
+    """
+  end
+
+  defp log(nil), do: "#### 📝 Log line\nI couldn't find it in the last 300 lines."
+
+  defp log(line),
+    do:
+      "#### 📝 Log line\nThe CVE ID is logged rather than used as a label, since every new ID would be a new series. One JSON object per line, pretty-printed here:\n" <>
+        Tour.UI.json_block(line)
+
+  defp labels(%{series: series}, family), do: String.replace_prefix(series, family, "")
+
+  defp delta(%{before: before, after: later}) when is_number(before) and is_number(later),
+    do: round(later - before)
+
+  defp delta(%{after: later}), do: "new, #{later}"
+
+  defp edge_order(:inf), do: {1, 0}
+  defp edge_order(edge), do: {0, edge}
+
+  defp edge_label(:inf), do: "+Inf"
+  defp edge_label(edge), do: "le=#{edge}"
+end
+```
+
+The app's metrics, from one container's `# TYPE` and `# HELP` lines, with the reason for each type.
+
+```elixir
+why = %{
+  "kev_process_duration_seconds" =>
+    {"1 histogram tracking latency",
+     "Bucket counts can be summed across containers before computing a quantile."},
+  "kev_process_success_total" =>
+    {"1 success counter",
+     "Only goes up. `rate()` turns it into lookups per second and handles restarts."},
+  "kev_process_errors_total" =>
+    {"1 errors counter", "Counted by the app's `reason`, not the HTTP status."},
+  "kev_catalog_age_seconds" =>
+    {"1 gauge",
+     "Age of the catalog in use. It drops when a refresh lands, so it can't be a counter."},
+  "kev_catalog_entries" => {"", "Catalog size. A refresh can shrink it."},
+  "http_requests_total" =>
+    {"The roll-up's target",
+     "Every response by method, route, and status. The alerts and the roll-up use it."},
+  "vm_memory_total_bytes" => {"", "Memory allocated by the Erlang VM."},
+  "vm_run_queue_length" =>
+    {"", "Processes waiting for a scheduler. Sustained growth means CPU bound."}
+}
+
+catalog =
+  with [container | _others] <- Tour.Docker.apps(),
+       {:ok, text} <- Tour.App.metrics(container.ports[9568]) do
+    rows =
+      for %{name: name, type: type, help: help} <-
+            Tour.Core.Exposition.catalog(Tour.Core.Exposition.parse(text)) do
+        {point, reason} = Map.get(why, name, {"", ""})
+        ["`#{name}`", type, point, reason, help]
+      end
+
+    log_row = [
+      "one JSON line per lookup",
+      "log",
+      "1 log line",
+      "Holds the CVE ID and raw input, which would be unbounded as labels.",
+      ""
+    ]
+
+    Tour.UI.table(
+      ["Metric", "Type", "Requirement", "Why this type", "The app's own help text"],
+      rows ++ [log_row]
+    )
+  else
+    _not_running ->
+      Tour.UI.note(:error, "No app container is answering. Start the stack in the Control room.")
+  end
+```
+
+Send one lookup. A listed ID increments the success counter and `123` the errors counter. Both move the histogram and `http_requests_total`.
+
+```elixir
+send_one =
+  Kino.Control.form(
+    [
+      id:
+        Kino.Input.select("ID to send", [
+          {"CVE-2021-44228", "CVE-2021-44228 (on the list)"},
+          {"CVE-2023-99999", "CVE-2023-99999 (not on the list)"},
+          {"123", "123 (not a CVE)"}
+        ])
+    ],
+    submit: "Send one request"
+  )
+
+signals = Tour.UI.frame("Press Send one request.")
+moved = Tour.UI.frame()
+
+Kino.listen(send_one, fn %{data: %{id: id}} ->
+  Kino.Frame.render(
+    signals,
+    Tour.UI.note(:info, "Pausing the load generator and sending one lookup...")
+  )
+
+  Kino.Frame.render(moved, Kino.Markdown.new(""))
+
+  Tour.UI.draw(signals, fn ->
+    case Tour.OneRequest.run(id) do
+      {:ok, result} ->
+        rows = Enum.map(result.changes, &["`#{&1.series}`", &1.type, &1.before, &1.after])
+
+        Kino.Frame.render(
+          moved,
+          Tour.UI.table(["Every series that moved", "Type", "Before", "After"], rows)
+        )
+
+        Tour.Signals.cards(result)
+
+      {:error, reason} ->
+        Tour.UI.note(:error, reason)
+    end
+  end)
+end)
+
+Tour.UI.stack([send_one, signals, moved])
+```
+
+## 3. Histogram x-ray
+
+Prometheus stores histogram buckets as cumulative counts: `le="0.025"` counts lookups at or under 25 ms, and `le="+Inf"` counts all of them. `histogram_quantile` finds the bucket that holds the requested rank and interpolates linearly inside it, so the error is at most that bucket's width. The app's bucket edges:
+
+````elixir
+source = Path.join(Tour.Config.repo(), "lib/kev_check_web/telemetry.ex")
+
+case File.read(source) do
+  {:ok, text} ->
+    lines =
+      Regex.run(~r/  # Seconds\..*?@latency_buckets \[[^\]]+\]/s, text) ||
+        ["@latency_buckets not found"]
+
+    Kino.Markdown.new("`lib/kev_check_web/telemetry.ex`\n```elixir\n#{hd(lines)}\n```")
+
+  {:error, reason} ->
+    Tour.UI.note(:error, "Couldn't read #{source}: #{:file.format_error(reason)}")
+end
+````
+
+`Tour.Core.Quantile` reimplements `histogram_quantile` and keeps each step. `walk/2` moves through adjacent buckets until the cumulative count reaches the rank, then interpolates. `when` adds a guard condition to a function clause.
+
+```elixir
+defmodule Tour.Core.Quantile do
+  @moduledoc """
+  Prometheus's `histogram_quantile`, rewritten so every step can be shown: find the bucket
+  the rank falls in, then assume values are spread evenly inside it.
+  """
+
+  @type edge :: float() | :inf
+  @type bucket :: {edge(), number()}
+  @type estimate :: %{
+          q: float(),
+          total: number(),
+          rank: float(),
+          lower: float(),
+          upper: edge(),
+          below: number(),
+          at_upper: number(),
+          value: float()
+        }
+
+  @doc "Cumulative buckets from `le` samples, sorted by edge, with any dip flattened the way Prometheus does."
+  @spec from_samples([%{labels: map(), value: term()}]) :: [bucket()]
+  def from_samples(samples) do
+    samples
+    |> Enum.flat_map(&bucket/1)
+    |> Enum.sort_by(&order/1)
+    |> Enum.scan(fn {edge, count}, {_previous, floor} -> {edge, max(count, floor)} end)
+  end
+
+  @doc "Estimate quantile `q` from cumulative buckets ending in `+Inf`, or `:no_data` when they're empty."
+  @spec estimate(float(), [bucket()]) :: estimate() | :no_data
+  def estimate(q, buckets) when is_number(q) and q > 0 and q <= 1 do
+    case List.last(buckets) do
+      {:inf, total} when total > 0 ->
+        walk([{0.0, 0} | buckets], %{q: q, total: total, rank: q * total})
+
+      _empty ->
+        :no_data
+    end
+  end
+
+  @doc "Keep only the given finite edges, plus `+Inf`, to see what coarser buckets would have said."
+  @spec keep_edges([bucket()], [float()]) :: [bucket()]
+  def keep_edges(buckets, edges),
+    do: Enum.filter(buckets, fn {edge, _count} -> edge == :inf or edge in edges end)
+
+  # Past the last finite edge, Prometheus answers with that edge.
+  defp walk([{lower, below}, {:inf, _total} | _rest], step),
+    do:
+      Map.merge(step, %{
+        lower: lower,
+        upper: :inf,
+        below: below,
+        at_upper: step.total,
+        value: lower
+      })
+
+  defp walk([{lower, below}, {upper, at_upper} | _rest], %{rank: rank} = step)
+       when at_upper >= rank do
+    value = lower + (upper - lower) * (rank - below) / (at_upper - below)
+    Map.merge(step, %{lower: lower, upper: upper, below: below, at_upper: at_upper, value: value})
+  end
+
+  defp walk([_passed | rest], step), do: walk(rest, step)
+
+  defp bucket(%{labels: %{"le" => le}, value: count}) when is_number(count),
+    do: [{Tour.Core.PromJSON.value(le), count}]
+
+  defp bucket(_no_count), do: []
+
+  defp order({:inf, _count}), do: {1, 0}
+  defp order({edge, _count}), do: {0, edge}
+end
+```
+
+```elixir
+defmodule Tour.QuantileTest do
+  use ExUnit.Case, async: true
+
+  alias Tour.Core.Quantile
+
+  @buckets [{0.1, 50}, {0.2, 90}, {:inf, 100}]
+
+  test "worked examples, checked by hand" do
+    for {q, expected} <- [{0.5, 0.1}, {0.7, 0.15}, {0.9, 0.2}, {0.95, 0.2}] do
+      assert_in_delta Quantile.estimate(q, @buckets).value, expected, 1.0e-9
+    end
+  end
+
+  test "the README's own example: 7.6 lookups under 25 ms, 8.105 under 50 ms" do
+    estimate = Quantile.estimate(0.95, [{0.025, 7.6}, {0.05, 8.105}, {:inf, 8.105}])
+    assert %{lower: 0.025, upper: 0.05} = estimate
+    assert_in_delta estimate.value, 0.02994, 1.0e-5
+  end
+
+  test "an empty histogram has no answer, the way Prometheus returns NaN" do
+    assert Quantile.estimate(0.95, [{0.1, 0}, {:inf, 0}]) == :no_data
+    assert Quantile.estimate(0.95, []) == :no_data
+  end
+
+  test "samples arrive unsorted with string edges, and a dip is flattened" do
+    samples = [
+      %{labels: %{"le" => "+Inf"}, value: 10.0},
+      %{labels: %{"le" => "0.25"}, value: 9.0},
+      %{labels: %{"le" => "0.1"}, value: 9.5}
+    ]
+
+    assert Quantile.from_samples(samples) == [{0.1, 9.5}, {0.25, 9.5}, {:inf, 10.0}]
+  end
+
+  test "coarser buckets give a worse answer from the same data" do
+    fine = [{0.01, 10}, {0.025, 95}, {0.05, 99}, {0.1, 100}, {:inf, 100}]
+    coarse = Quantile.keep_edges(fine, [0.1])
+    assert coarse == [{0.1, 100}, {:inf, 100}]
+    assert Quantile.estimate(0.5, fine).value < Quantile.estimate(0.5, coarse).value
+  end
+end
+
+ExUnit.run()
+```
+
+`Tour.XRay` queries the bucket counts and Prometheus's `histogram_quantile` at the same timestamp, computes the quantile with `Tour.Core.Quantile`, and shows both.
+
+```elixir
+defmodule Tour.XRay do
+  @moduledoc """
+  Section 3's reveal: fetch the buckets and Prometheus's own answer at the same instant,
+  work the quantile out step by step, and chart the buckets.
+  """
+
+  alias Tour.Core.Quantile
+  alias VegaLite, as: Vl
+
+  @edge_sets %{decades: [0.01, 0.1, 1.0], slo: [0.25]}
+
+  @doc "The whole reveal for a form with `:window`, `:q`, `:edges`, and `:guess`."
+  @spec reveal(map()) :: Kino.Layout.t() | Kino.Markdown.t()
+  def reveal(%{window: window, q: q} = form) do
+    at = System.os_time(:second)
+
+    buckets_expr =
+      ~s|sum by (le) (increase(kev_process_duration_seconds_bucket{env="production"}[#{window}]))|
+
+    answer_expr = "histogram_quantile(#{q}, #{buckets_expr})"
+
+    with {:ok, samples} <- Tour.Prom.query(buckets_expr, time: at),
+         {:ok, answer} <- Tour.Prom.query(answer_expr, time: at) do
+      buckets = Quantile.from_samples(samples)
+      draw(buckets, Quantile.estimate(q, buckets), prometheus_value(answer), form, answer_expr)
+    else
+      {:error, reason} -> Tour.UI.note(:error, reason)
+    end
+  end
+
+  defp draw(_buckets, :no_data, _prometheus, _form, _expr),
+    do: Tour.UI.note(:warn, "No lookups in that window. Is the load generator running?")
+
+  defp draw(buckets, estimate, prometheus, form, expr) do
+    Tour.UI.stack([
+      Kino.Markdown.new(steps(estimate) <> "\n" <> verdict(estimate, prometheus, form.guess)),
+      charts(buckets, estimate),
+      coarse(buckets, estimate, form),
+      Tour.UI.promql(expr)
+    ])
+  end
+
+  defp steps(%{upper: :inf} = e) do
+    """
+    1. Lookups in the window: **#{n(e.total)}**. The `+Inf` bucket counts all of them.
+    2. The rank: #{e.q} × #{n(e.total)} = **#{n(e.rank)}**.
+    3. Only #{n(e.below)} lookups are at or under the last finite edge, #{Tour.UI.ms(e.lower)}, so the rank is past it.
+    4. Prometheus can't see past that edge, so it answers with the edge itself: **#{Tour.UI.ms(e.value)}**.
+    """
+  end
+
+  defp steps(e) do
+    fraction = (e.rank - e.below) / (e.at_upper - e.below)
+
+    """
+    1. Lookups in the window: **#{n(e.total)}**. The `+Inf` bucket counts all of them, and `increase()` extrapolates to the window's edges, which is why the counts have decimals.
+    2. The rank: #{e.q} × #{n(e.total)} = **#{n(e.rank)}**. Line the lookups up fastest first, and the answer is the latency at that position.
+    3. #{n(e.below)} lookups are at or under #{Tour.UI.ms(e.lower)} and #{n(e.at_upper)} at or under #{Tour.UI.ms(e.upper)}, so that lookup is in the #{Tour.UI.ms(e.lower)} to #{Tour.UI.ms(e.upper)} bucket.
+    4. Assume the lookups inside it are spread evenly: (#{n(e.rank)} − #{n(e.below)}) / (#{n(e.at_upper)} − #{n(e.below)}) = **#{Float.round(fraction * 100, 1)}%** of the way through.
+    5. #{Tour.UI.ms(e.lower)} + #{Float.round(fraction, 3)} × (#{Tour.UI.ms(e.upper)} − #{Tour.UI.ms(e.lower)}) = **#{Tour.UI.ms(e.value)}**.
+    """
+  end
+
+  defp verdict(estimate, prometheus, guess) do
+    check =
+      if is_number(prometheus) and abs(prometheus - estimate.value) < 1.0e-9,
+        do:
+          "#{Tour.UI.mark(:ok)} Prometheus's `histogram_quantile` says **#{precise(prometheus)}**, the same as mine, **#{precise(estimate.value)}**.",
+        else:
+          "#{Tour.UI.mark(:warn)} Prometheus says #{precise(prometheus)}, I get #{precise(estimate.value)}."
+
+    check <> "\n\n" <> guessed(guess, estimate.value)
+  end
+
+  defp guessed(guess, value) when is_number(guess),
+    do: "🎯 Your guess was #{guess} ms, off by #{Float.round(abs(guess - value * 1000), 1)} ms."
+
+  defp guessed(_no_guess, _value), do: ""
+
+  defp coarse(_buckets, _estimate, %{edges: :all}), do: Kino.Markdown.new("")
+
+  defp coarse(buckets, estimate, %{edges: edges, q: q}) do
+    case Quantile.estimate(q, Quantile.keep_edges(buckets, @edge_sets[edges])) do
+      :no_data ->
+        Kino.Markdown.new("")
+
+      rough ->
+        Tour.UI.note(
+          :info,
+          "With only those edges, the same lookups give **#{Tour.UI.ms(rough.value)}** instead of #{Tour.UI.ms(estimate.value)}. " <>
+            "The latency didn't change. The bucket got wider, and the estimate can be off by up to its width, " <>
+            "here #{Tour.UI.ms(rough.lower)} to #{Tour.UI.ms(rough.upper)}."
+        )
+    end
+  end
+
+  defp charts(buckets, estimate) do
+    rows =
+      buckets
+      |> Enum.zip([{0.0, 0} | buckets])
+      |> Enum.map(fn {{edge, cumulative}, {_previous, below}} ->
+        %{
+          "bucket" => label(edge),
+          "in this bucket" => cumulative - below,
+          "at or under the edge" => cumulative,
+          "where" => if(edge == estimate.upper, do: "holds the answer", else: "other")
+        }
+      end)
+
+    Kino.Layout.grid(
+      [
+        bars(rows, "in this bucket", "Lookups in each bucket"),
+        bars(rows, "at or under the edge", "What Prometheus stores (cumulative)")
+      ],
+      columns: 2
+    )
+  end
+
+  defp bars(rows, field, title) do
+    Vl.new(width: 330, height: 200, title: title)
+    |> Vl.data_from_values(rows)
+    |> Vl.mark(:bar)
+    |> Vl.encode_field(:x, "bucket",
+      type: :ordinal,
+      sort: nil,
+      title: "upper edge, ms",
+      axis: [label_angle: 0]
+    )
+    |> Vl.encode_field(:y, field, type: :quantitative, title: "lookups")
+    |> Vl.encode_field(:color, "where",
+      type: :nominal,
+      legend: nil,
+      scale: [domain: ["holds the answer", "other"], range: ["#e4572e", "#76b7b2"]]
+    )
+  end
+
+  defp prometheus_value([%{value: value} | _rest]), do: value
+  defp prometheus_value([]), do: :nan
+
+  defp label(:inf), do: "+Inf"
+
+  defp label(edge) do
+    ms = Float.round(edge * 1000, 3)
+    if ms == trunc(ms), do: Integer.to_string(trunc(ms)), else: Float.to_string(ms)
+  end
+
+  defp n(number) when is_number(number), do: :erlang.float_to_binary(number * 1.0, decimals: 1)
+
+  defp precise(seconds) when is_number(seconds), do: "#{Float.round(seconds * 1000.0, 3)} ms"
+  defp precise(other), do: inspect(other)
+end
+```
+
+Lookups sleep a random 0 to 25 ms, and the load generator sends about 10 a second. Enter a guess for the p95 and press Reveal. The bucket edge setting recomputes the same data with fewer edges.
+
+```elixir
+xray =
+  Kino.Control.form(
+    [
+      window:
+        Kino.Input.select("Window", [
+          {"5m", "last 5 minutes"},
+          {"1m", "last minute"},
+          {"15m", "last 15 minutes"}
+        ]),
+      q:
+        Kino.Input.select("Quantile", [{0.95, "p95"}, {0.5, "p50"}, {0.9, "p90"}, {0.99, "p99"}]),
+      edges:
+        Kino.Input.select("Bucket edges", [
+          {:all, "all 11 the app uses"},
+          {:decades, "only 10 ms, 100 ms, and 1 s"},
+          {:slo, "only 250 ms"}
+        ]),
+      guess: Kino.Input.number("Your guess, in ms", default: 20)
+    ],
+    submit: "Reveal"
+  )
+
+reveal = Tour.UI.frame("Make a guess, then press Reveal.")
+Kino.listen(xray, fn %{data: form} -> Tour.UI.draw(reveal, fn -> Tour.XRay.reveal(form) end) end)
+Tour.UI.stack([xray, reveal])
+```
+
+The two queries from the README. The error share sits around 20% because 4 of the 20 IDs the load generator sends are invalid, which is why the paging alerts use 5xx responses instead.
+
+````elixir
+per_second = fn
+  value when is_number(value) -> "#{Float.round(value * 1.0, 3)}/s"
+  _missing -> "no data"
+end
+
+readme_queries = [
+  {"How slow are the slowest 5% of lookups",
+   "histogram_quantile(0.95, sum by (env, le) (rate(kev_process_duration_seconds_bucket[5m])))",
+   &Tour.UI.ms/1},
+  {"What share of lookups couldn't be answered",
+   "sum by (env) (rate(kev_process_errors_total[5m]))\n/\n(sum by (env) (rate(kev_process_errors_total[5m])) + sum by (env) (rate(kev_process_success_total[5m])))",
+   &Tour.UI.percent/1},
+  {"Which kind of error it was", "sum by (reason) (rate(kev_process_errors_total[5m]))",
+   per_second}
+]
+
+answer_line = fn {title, expr, format} ->
+  values =
+    case Tour.Prom.query(expr) do
+      {:ok, samples} ->
+        Enum.map_join(
+          samples,
+          ", ",
+          &"#{Enum.join(Map.values(&1.labels), " ")} **#{format.(&1.value)}**"
+        )
+
+      {:error, reason} ->
+        reason
+    end
+
+  Kino.Markdown.new(
+    "**#{title}:** #{values}\n```promql\n#{expr}\n```\n#{Tour.UI.prom_link(expr)}"
+  )
+end
+
+Tour.Live.panel(fn -> Tour.UI.stack(Enum.map(readme_queries, answer_line)) end)
+````
+
+## 4. Many copies
+
+Prometheus discovers the app containers through the Docker socket and labels each series with `pod` (container name), `instance` (IP and port), and `env`.
+
+Counters reset to 0 when a container restarts. `rate()` handles a reset within one series, so take `rate()` per series and then `sum()`; summing first hides the reset. Each container also adds its own set of series. Compose keeps container names across restarts, so new series only appear when scaling up.
+
+**Kill one app container** restarts a container: its raw counter drops to 0, `sum(rate())` stays steady, and `rate(sum())` spikes. **Scale** to 4 raises the raw series count while the rolled-up count stays the same.
+
+```elixir
+kill = Kino.Control.button("Kill one app container")
+
+scale_to =
+  Kino.Control.form(
+    [
+      n:
+        Kino.Input.select("App containers", Enum.map(1..5, &{&1, Integer.to_string(&1)}),
+          default: 4
+        )
+    ],
+    submit: "Scale"
+  )
+
+happened = Tour.UI.frame()
+
+crashed = fn
+  name, :ok ->
+    Tour.UI.note(
+      :ok,
+      "Crashed `#{name}` with exit code 1. Docker restarts it under the same name, so `pod` keeps its value and the counter starts again from 0."
+    )
+
+  _name, {:error, reason} ->
+    Tour.UI.note(:error, reason)
+end
+
+Kino.listen(kill, fn _click ->
+  Tour.UI.draw(happened, fn ->
+    case Tour.Docker.apps() do
+      [%{name: name} | _others] -> crashed.(name, Tour.Docker.crash(name))
+      [] -> Tour.UI.note(:error, "No app container is running.")
+    end
+  end)
+end)
+
+Kino.listen(scale_to, fn %{data: %{n: n}} ->
+  Tour.UI.run_in(happened, "make", ["scale", "N=#{n}"])
+end)
+
+Tour.UI.stack([Kino.Layout.grid([kill, scale_to], columns: 2), happened])
+```
+
+The last 15 minutes, refreshed every 5 seconds:
+
+```elixir
+requests = ~s|http_requests_total{env="production", route="/process"}|
+
+Kino.Layout.grid(
+  [
+    Tour.Live.chart(
+      "Lookups per second, per container",
+      [
+        {"{pod}", "sum by (pod) (rate(#{requests}[1m]))"},
+        {"whole fleet", "sum(rate(#{requests}[1m]))"}
+      ],
+      unit: "requests/s"
+    ),
+    Tour.Live.chart(
+      "The raw counter in each container",
+      [{"{pod}", "sum by (pod) (#{requests})"}],
+      unit: "requests since boot"
+    ),
+    Tour.Live.chart(
+      "Rate then sum (right) vs sum then rate (wrong)",
+      [
+        {"sum(rate(x))", "sum(rate(#{requests}[1m]))"},
+        {"rate(sum(x))", "rate(sum(#{requests})[1m:15s])"}
+      ],
+      unit: "requests/s"
+    ),
+    Tour.Live.chart(
+      "Series stored: raw vs rolled up",
+      [
+        {"raw, with pod and instance", ~s|count(http_requests_total{env="production"})|},
+        {"rolled up, without them", "count(rollup_preview:http_requests_total:rate1m)"}
+      ],
+      unit: "series"
+    )
+  ],
+  columns: 2
+)
+```
+
+The queries behind the charts:
+
+```elixir
+[
+  ~s|sum by (pod) (rate(http_requests_total{env="production", route="/process"}[1m]))|,
+  ~s|rate(sum(http_requests_total{env="production", route="/process"})[1m:15s])|,
+  ~s|count(http_requests_total{env="production"})|
+]
+|> Enum.map(&Tour.UI.promql/1)
+|> Tour.UI.stack()
+```
+
+## 5. Across services
+
+The proxy returns an `x-request-id` header and each container logs it, so one request can be found across containers. Across services, the same idea is a trace.
+
+For several services I'd use OpenTelemetry: the same request rate, error, and duration metrics and labels in every service, W3C trace context on every call, exemplars linking histogram buckets to traces, and an OpenTelemetry Collector per cluster forwarding to Chronosphere.
+
+```mermaid
+flowchart LR
+  subgraph cluster["One cluster"]
+    A["kev-check"] -- "traceparent header" --> B["another service"]
+    A -- "OTLP: metrics, traces, logs" --> C["OTel Collector"]
+    B -- "OTLP" --> C
+  end
+  C -- "batched, sampled" --> D["Chronosphere"]
+  D --> E["Dashboards and SLO alerts"]
+  D -. "exemplar: slow bucket to trace" .-> F["Trace view"]
+```
+
+The latest log lines from every app container, refreshed every 5 seconds.
+
+```elixir
+columns = ["time", "container", "level", "message", "ms", "request id"]
+
+table =
+  Kino.DataTable.new([], keys: columns, name: "Latest lookups from every container", num_rows: 15)
+
+as_row = fn row ->
+  %{
+    "time" => String.slice(row.time, 11, 12),
+    "container" => row.pod,
+    "level" => row.level,
+    "message" => row.message,
+    "ms" => row.duration_ms,
+    "request id" => row.request_id
+  }
+end
+
+rows_for = fn container ->
+  case Tour.Docker.logs(container.name, 15) do
+    {:ok, output} -> Tour.Core.LogLine.rows(output, container.name)
+    {:error, _reason} -> []
+  end
+end
+
+refresh = fn ->
+  rows =
+    Tour.Docker.apps()
+    |> Enum.flat_map(rows_for)
+    |> Enum.sort_by(& &1.time, :desc)
+    |> Enum.take(30)
+    |> Enum.map(as_row)
+
+  Kino.DataTable.update(table, rows, keys: columns)
+end
+
+refresh.()
+Kino.listen(5_000, fn _tick -> refresh.() end)
+table
+```
+
+Send one lookup through the proxy and find the container that served it by its request ID.
+
+```elixir
+follow = Kino.Control.button("Send one lookup through the proxy and find who served it")
+followed = Tour.UI.frame()
+
+Kino.listen(follow, fn _click ->
+  Tour.UI.draw(followed, fn ->
+    with {:ok, reply} <- Tour.App.lookup("CVE-2021-44228"),
+         {:ok, container, line} <- Tour.Docker.find_log(reply.request_id) do
+      Kino.Markdown.new(
+        "The proxy answered HTTP #{reply.status} with `x-request-id: #{reply.request_id}`. " <>
+          "That ID is in **#{container}**'s log:\n\n#{Tour.UI.json_block(line)}"
+      )
+    else
+      {:error, reason} ->
+        Tour.UI.note(:error, reason)
+
+      :error ->
+        Tour.UI.note(:warn, "No container's recent log has that request ID yet. Try again.")
+    end
+  end)
+end)
+
+Tour.UI.stack([follow, followed])
+```
+
+## 6. Alerting
+
+The alerts page on symptoms users see and open tickets for causes, and they evaluate the whole environment rather than single containers. The SLO is 99.9% of lookups succeeding and 95% finishing within 250 ms, which leaves an error budget of 0.1% a month.
+
+The fast-burn alert fires when more than 1.44% of requests fail over both the last 5 minutes and the last hour. That's 14.4 times the budget rate, enough to spend a month's budget in about two days. Rules group by `env`, so they keep working after the roll-up removes `pod`.
+
+A page takes about 7 minutes after errors start: the 1 hour ratio needs about 5 minutes to pass 1.44%, then the rule waits 2 minutes. Applying a 20% error rate before section 3 has it firing by the time you get here.
+
+`Tour.Core.Budget` computes burn rates. A ratio of NaN means there was no traffic in the window. `Tour.Core.AlertBoard` combines Prometheus's alert rules with Alertmanager's routing.
+
+```elixir
+defmodule Tour.Core.Budget do
+  @moduledoc """
+  Error-budget arithmetic for the 99.9% SLO: how fast a failure ratio spends the budget, and
+  which burn-rate pair it trips.
+  """
+
+  @allowed 0.001
+  @pairs [
+    {"5m", 14.4, "page"},
+    {"1h", 14.4, "page"},
+    {"30m", 6.0, "ticket"},
+    {"6h", 6.0, "ticket"}
+  ]
+
+  @type burn :: float() | :no_traffic | :no_data
+  @type meter :: %{
+          window: String.t(),
+          ratio: term(),
+          burn: burn(),
+          threshold: float(),
+          severity: String.t(),
+          over?: boolean()
+        }
+
+  @doc "How many times faster than allowed `ratio` spends the budget. NaN means nothing was requested."
+  @spec burn_rate(term()) :: burn()
+  def burn_rate(:nan), do: :no_traffic
+  def burn_rate(ratio) when is_number(ratio), do: ratio / @allowed
+  def burn_rate(_missing), do: :no_data
+
+  @doc "The four burn-rate meters, from the recorded ratios keyed by window."
+  @spec meters(%{String.t() => term()}) :: [meter()]
+  def meters(ratios) do
+    for {window, threshold, severity} <- @pairs do
+      ratio = Map.get(ratios, window)
+      burn = burn_rate(ratio)
+
+      %{
+        window: window,
+        ratio: ratio,
+        burn: burn,
+        threshold: threshold,
+        severity: severity,
+        over?: is_number(burn) and burn > threshold
+      }
+    end
+  end
+
+  @doc "Days a month's budget lasts at `burn` times the allowed rate."
+  @spec days_left(burn()) :: float() | :forever
+  def days_left(burn) when is_number(burn) and burn > 0, do: 30 / burn
+  def days_left(_no_burn), do: :forever
+end
+```
+
+```elixir
+defmodule Tour.Core.AlertBoard do
+  @moduledoc """
+  Joins Prometheus's alerting rules with Alertmanager's routing into one row per alert, the
+  worst state first.
+  """
+
+  @order %{"firing" => 0, "pending" => 1, "inactive" => 2}
+
+  @type row :: %{
+          name: String.t(),
+          state: String.t(),
+          severity: String.t() | nil,
+          wait: String.t(),
+          active_for: String.t(),
+          receiver: String.t()
+        }
+
+  @doc "One row per rule: state, severity, how long it's been active, and where Alertmanager sent it."
+  @spec rows([map()], [map()], DateTime.t()) :: [row()]
+  def rows(rules, routed, now) do
+    receivers = Map.new(routed, &{&1["labels"]["alertname"], receivers(&1)})
+
+    rules
+    |> Enum.map(&row(&1, receivers, now))
+    |> Enum.sort_by(&{Map.get(@order, &1.state, 3), &1.name})
+  end
+
+  @doc "Seconds as `45s`, `2m`, `3m 12s`, or `1h 5m`."
+  @spec elapsed(integer()) :: String.t()
+  def elapsed(seconds) when seconds < 60, do: "#{seconds}s"
+
+  def elapsed(seconds) when seconds >= 3600,
+    do: "#{div(seconds, 3600)}h #{div(rem(seconds, 3600), 60)}m"
+
+  def elapsed(seconds) when rem(seconds, 60) == 0, do: "#{div(seconds, 60)}m"
+  def elapsed(seconds), do: "#{div(seconds, 60)}m #{rem(seconds, 60)}s"
+
+  defp row(%{"name" => name, "state" => state} = rule, receivers, now) do
+    %{
+      name: name,
+      state: state,
+      severity: get_in(rule, ["labels", "severity"]),
+      wait: elapsed(round(Map.get(rule, "duration", 0))),
+      active_for: active_for(Map.get(rule, "alerts", []), now),
+      receiver: Map.get(receivers, name, "")
+    }
+  end
+
+  defp active_for([%{"activeAt" => at} | _others], now) do
+    case DateTime.from_iso8601(at) do
+      {:ok, since, _offset} -> elapsed(DateTime.diff(now, since))
+      {:error, _reason} -> ""
+    end
+  end
+
+  defp active_for(_none, _now), do: ""
+
+  defp receivers(%{"receivers" => receivers}), do: Enum.map_join(receivers, ", ", & &1["name"])
+end
+```
+
+```elixir
+defmodule Tour.AlertingTest do
+  use ExUnit.Case, async: true
+
+  alias Tour.Core.AlertBoard
+  alias Tour.Core.Budget
+
+  test "burn rates, and NaN reads as no traffic" do
+    assert_in_delta Budget.burn_rate(0.0144), 14.4, 1.0e-9
+    assert Budget.burn_rate(:nan) == :no_traffic
+    assert Budget.burn_rate(nil) == :no_data
+    assert_in_delta Budget.days_left(14.4), 2.08, 0.01
+  end
+
+  test "20% failing trips the fast pair, which pages" do
+    meters = Budget.meters(%{"5m" => 0.2, "1h" => 0.02, "30m" => 0.0, "6h" => :nan})
+
+    assert [
+             %{window: "5m", over?: true, severity: "page"},
+             %{window: "1h", over?: true},
+             %{window: "30m", over?: false, severity: "ticket"},
+             %{window: "6h", burn: :no_traffic, over?: false}
+           ] = meters
+  end
+
+  test "alerts sort firing first and pick up their Alertmanager receiver" do
+    rules = [
+      %{
+        "name" => "KevCheckSlowLookups",
+        "state" => "inactive",
+        "labels" => %{"severity" => "page"},
+        "duration" => 120
+      },
+      %{
+        "name" => "KevCheckErrorBudgetFastBurn",
+        "state" => "firing",
+        "labels" => %{"severity" => "page"},
+        "duration" => 120,
+        "alerts" => [%{"activeAt" => "2026-10-15T23:22:42.874564729Z"}]
+      }
+    ]
+
+    routed = [
+      %{
+        "labels" => %{"alertname" => "KevCheckErrorBudgetFastBurn"},
+        "receivers" => [%{"name" => "pager"}]
+      }
+    ]
+
+    assert [
+             %{
+               name: "KevCheckErrorBudgetFastBurn",
+               active_for: "3m 12s",
+               receiver: "pager",
+               wait: "2m"
+             },
+             %{name: "KevCheckSlowLookups", active_for: "", receiver: ""}
+           ] = AlertBoard.rows(rules, routed, ~U[2026-10-15 23:25:54.874564Z])
+  end
+end
+
+ExUnit.run()
+```
+
+`Tour.AlertDesk` reads the burn rates and alert states every 5 seconds.
+
+```elixir
+defmodule Tour.AlertDesk do
+  @moduledoc """
+  Section 6's board: the burn-rate meters and every alert's state, read fresh from Prometheus
+  and Alertmanager.
+  """
+
+  alias Tour.Core.AlertBoard
+  alias Tour.Core.Budget
+
+  @doc "The board, saying how long ago faults went in when `since` holds that moment."
+  @spec board({DateTime.t(), String.t()} | nil) :: Kino.Layout.t()
+  def board(since) do
+    now = DateTime.utc_now()
+    Tour.UI.stack([since_note(since, now), meters(), alerts(now)])
+  end
+
+  defp since_note(nil, _now), do: Tour.UI.note(:info, "No faults applied from here right now.")
+
+  defp since_note({at, what}, now),
+    do:
+      Tour.UI.note(
+        :info,
+        "Applied **#{what}** #{AlertBoard.elapsed(DateTime.diff(now, at))} ago."
+      )
+
+  defp meters do
+    ratios =
+      Map.new(
+        ["5m", "30m", "1h", "6h"],
+        &{&1, ratio(~s|kev:http_errors:ratio_rate#{&1}{env="production"}|)}
+      )
+
+    rows =
+      for meter <- Budget.meters(ratios) do
+        [
+          if(meter.over?, do: "🔥", else: "·"),
+          meter.window,
+          Tour.UI.percent(meter.ratio),
+          burn(meter.burn),
+          "#{meter.threshold}×, #{meter.severity}"
+        ]
+      end
+
+    slow = ratio(~s|kev:process_slow:ratio_rate5m{env="production"}|)
+
+    note =
+      "Share of lookups over 250 ms, last 5 minutes: **#{Tour.UI.percent(slow)}**. Slow lookups pages over 5%."
+
+    Tour.UI.stack([
+      Tour.UI.table(["", "Window", "5xx share", "Burn rate", "Alert threshold"], rows),
+      Kino.Markdown.new(note)
+    ])
+  end
+
+  defp alerts(now) do
+    routed =
+      case Tour.Alertmanager.alerts() do
+        {:ok, alerts} -> alerts
+        {:error, _reason} -> []
+      end
+
+    case Tour.Prom.alert_rules() do
+      {:ok, rules} ->
+        rows =
+          for row <- AlertBoard.rows(rules, routed, now),
+              do: [
+                Tour.UI.mark(row.state),
+                row.name,
+                row.state,
+                row.severity,
+                row.wait,
+                row.active_for,
+                row.receiver
+              ]
+
+        Tour.UI.table(
+          ["", "Alert", "State", "Severity", "Waits", "Active for", "Sent to"],
+          rows
+        )
+
+      {:error, reason} ->
+        Tour.UI.note(:error, reason)
+    end
+  end
+
+  defp ratio(expr) do
+    case Tour.Prom.query(expr) do
+      {:ok, [%{value: value} | _rest]} -> value
+      _missing -> nil
+    end
+  end
+
+  defp burn(rate) when is_number(rate) do
+    case Budget.days_left(rate) do
+      :forever ->
+        "#{Float.round(rate * 1.0, 1)}×"
+
+      days ->
+        "#{Float.round(rate * 1.0, 1)}×, a month's budget gone in #{Float.round(days, 1)} days"
+    end
+  end
+
+  defp burn(:no_traffic), do: "no traffic"
+  defp burn(_missing), do: "no data"
+end
+```
+
+Set latency and error rate, then press Apply. Latency is the maximum per lookup; 25 ms is the default. Reset faults restores the defaults.
+
+```elixir
+targets = [{:all, "every app container"} | Enum.map(Tour.Docker.apps(), &{&1.name, &1.name})]
+
+knobs =
+  Kino.Control.form(
+    [
+      latency_ms:
+        Kino.Input.range("Latency, up to this many ms", min: 0, max: 1000, step: 25, default: 25),
+      error_rate:
+        Kino.Input.range("Error rate (0.2 is 20%)", min: 0, max: 0.5, step: 0.05, default: 0.0),
+      target: Kino.Input.select("Apply to", targets)
+    ],
+    submit: "Apply"
+  )
+
+reset_faults = Kino.Control.button("Reset faults")
+applied = Tour.UI.frame()
+desk = Tour.UI.frame()
+
+apply_faults = fn %{latency_ms: ms, error_rate: rate, target: target} ->
+  names = if target == :all, do: Enum.map(Tour.Docker.apps(), & &1.name), else: [target]
+  results = Enum.map(names, &{&1, Tour.Docker.put_faults(&1, round(ms), rate)})
+
+  rows =
+    for {name, result} <- results do
+      case result do
+        {:ok, %{current: settings}} ->
+          [Tour.UI.mark(:ok), name, Tour.Core.Faults.describe(settings)]
+
+        {:error, reason} ->
+          [Tour.UI.mark(:error), name, reason]
+      end
+    end
+
+  Kino.Frame.render(applied, Tour.UI.table(["", "Container", "Now"], rows))
+
+  {DateTime.utc_now(),
+   "up to #{round(ms)} ms, #{round(rate * 100)}% errors on #{Enum.join(names, ", ")}"}
+end
+
+events =
+  Kino.Control.tagged_stream(
+    apply: knobs,
+    reset: reset_faults,
+    tick: Kino.Control.interval(5_000)
+  )
+
+Kino.listen(events, nil, fn
+  {:apply, %{data: data}}, _since ->
+    {:cont, apply_faults.(data)}
+
+  {:reset, _click}, _since ->
+    Tour.UI.draw(applied, &Tour.UI.reset_everything/0)
+    {:cont, nil}
+
+  {:tick, _tick}, since ->
+    Tour.UI.draw(desk, fn -> Tour.AlertDesk.board(since) end)
+    {:cont, since}
+end)
+
+Tour.UI.draw(desk, fn -> Tour.AlertDesk.board(nil) end)
+
+Tour.UI.stack([
+  knobs,
+  reset_faults,
+  applied,
+  desk,
+  Kino.Markdown.new(
+    "[Prometheus alerts ↗](http://localhost:9090/alerts) · [Alertmanager ↗](http://localhost:9093)"
+  )
+])
+```
+
+The last 15 minutes, refreshed every 5 seconds. The dashed lines are the alert thresholds.
+
+```elixir
+Kino.Layout.grid(
+  [
+    Tour.Live.chart(
+      "5xx share: 5 minute and 1 hour windows",
+      [
+        {"5 minutes", ~s|kev:http_errors:ratio_rate5m{env="production"}|},
+        {"1 hour", ~s|kev:http_errors:ratio_rate1h{env="production"}|}
+      ],
+      unit: "share failing",
+      thresholds: [{"pages at 1.44%", 0.0144}]
+    ),
+    Tour.Live.chart(
+      "p95 latency and the 250 ms SLO",
+      [
+        {"p95",
+         ~s|histogram_quantile(0.95, sum by (le) (rate(kev_process_duration_seconds_bucket{env="production"}[1m])))|}
+      ],
+      unit: "seconds",
+      thresholds: [{"SLO, 250 ms", 0.25}]
+    )
+  ],
+  columns: 2
+)
+```
+
+## 7. Chronosphere: shaping the data
+
+The repo's roll-up rule removes `pod` and `instance` from `http_requests_total` in `env:production`, drops the raw data, and stores at a 60 second interval. Chronosphere has four kinds of shaping rule:
+
+| Rule                                                                                                          | When it acts                    | What's stored                                      | Saves storage? | Here                                                                     |
+| ------------------------------------------------------------------------------------------------------------- | ------------------------------- | -------------------------------------------------- | -------------- | ------------------------------------------------------------------------ |
+| [Drop](https://docs.chronosphere.io/control/shaping/rules/drop-rules)                                         | As data arrives                 | Nothing for matching series                        | Yes, all of it | `chronosphere/drop-health-checks.yaml`, in `PREVIEW`                     |
+| [Roll-up](https://docs.chronosphere.io/control/shaping/rules/rollup)                                          | As data arrives, before storage | The aggregate, and the raw only without `drop_raw` | Yes            | `chronosphere/rollup-http-requests-total.yaml`, the rule this repo ships |
+| [Recording](https://docs.chronosphere.io/control/shaping/rules/recording)                                     | On a schedule, after storage    | The raw data plus the query's result               | No             | `ops/prometheus/rules.yml` uses them for the SLO ratios                  |
+| [Derived metric](https://docs.chronosphere.io/investigate/querying/metrics/derived-telemetry/derived-metrics) | When someone queries it         | Nothing extra, it's a saved query with a name      | No             | `chronosphere/derived-error-ratio.yaml`, the README's second query       |
+
+`Tour.Core.RollupRule` renders the rule as chronoctl YAML and checks it against the requirements. `Tour.Core.Rollup` estimates series and point counts before and after.
+
+```elixir
+defmodule Tour.Core.RollupRule do
+  @moduledoc """
+  Builds a Chronosphere roll-up rule from a few choices, writes it as chronoctl YAML in the
+  shape of the file in `chronosphere/`, and checks it against the requirements.
+  """
+
+  @type t :: %{
+          metric: String.t(),
+          env: String.t(),
+          discard: [String.t()],
+          interval: String.t(),
+          drop_raw: boolean(),
+          mode: String.t()
+        }
+
+  @doc "The rule this repo needs: `http_requests_total` in production without `pod` and `instance`, raw dropped, 60s."
+  @spec required() :: t()
+  def required,
+    do: %{
+      metric: "http_requests_total",
+      env: "production",
+      discard: ["pod", "instance"],
+      interval: "60s",
+      drop_raw: true,
+      mode: "ENABLED"
+    }
+
+  @doc "The rule as chronoctl YAML."
+  @spec to_yaml(t()) :: String.t()
+  def to_yaml(rule) do
+    """
+    api_version: v1/config
+    kind: RollupRule
+    spec:
+      slug: #{String.replace(rule.metric, "_", "-")}-#{rule.env}-without-#{Enum.join(rule.discard, "-")}
+      name: #{rule.metric} in #{rule.env} without #{Enum.join(rule.discard, " and ")}
+      filters:
+        - name: __name__
+          value_glob: #{rule.metric}
+        - name: env
+          value_glob: #{rule.env}
+      metric_name: '{{ .MetricName }}:without_#{Enum.join(rule.discard, "_")}'
+      metric_type: CUMULATIVE_COUNTER
+      aggregation: SUM
+      interval: #{rule.interval}
+      label_policy:
+    #{discard(rule.discard)}
+      drop_raw: #{rule.drop_raw}
+      add_metric_type_label: true
+      mode: #{rule.mode}
+    """
+  end
+
+  @doc "Each requirement for the rule, and whether `rule` meets it."
+  @spec check(t()) :: [{String.t(), boolean()}]
+  def check(rule) do
+    [
+      {"Rolls up the counter `http_requests_total`", rule.metric == "http_requests_total"},
+      {"Only in `env:production`", rule.env == "production"},
+      {"Removes `pod` and `instance`", "pod" in rule.discard and "instance" in rule.discard},
+      {"Removes nothing else, so `method`, `route`, and `status` survive",
+       rule.discard -- ["pod", "instance"] == []},
+      {"Drops the raw data", rule.drop_raw},
+      {"Stores one point every 60s", rule.interval == "60s"}
+    ]
+  end
+
+  @doc "True when two rule files say the same thing once comments and blank lines are gone."
+  @spec same?(String.t(), String.t()) :: boolean()
+  def same?(yaml, other), do: meaningful(yaml) == meaningful(other)
+
+  defp discard([]), do: "    discard: []"
+  defp discard(labels), do: "    discard:\n" <> Enum.map_join(labels, "\n", &"      - #{&1}")
+
+  defp meaningful(text) do
+    text
+    |> String.split("\n")
+    |> Enum.map(&String.trim_trailing/1)
+    |> Enum.reject(&(&1 == "" or String.starts_with?(String.trim_leading(&1), "#")))
+  end
+end
+```
+
+```elixir
+defmodule Tour.Core.Rollup do
+  @moduledoc """
+  The series math behind the roll-up: how many series the raw data has, and how many are
+  left once `pod` and `instance` are gone.
+  """
+
+  @type fleet :: %{pods: pos_integer(), combos: pos_integer(), deploys_per_day: non_neg_integer()}
+
+  @doc "Distinct series over a day, raw and rolled up. Every deploy brings a new set of pod names."
+  @spec estimate(fleet()) :: %{raw_series: pos_integer(), rolled_series: pos_integer()}
+  def estimate(%{pods: pods, combos: combos, deploys_per_day: deploys}),
+    do: %{raw_series: pods * combos * (deploys + 1), rolled_series: combos}
+
+  @doc "Group series by their labels once `drop` is removed, with how many merge into each."
+  @spec merge([map()], [String.t()]) :: [{map(), pos_integer()}]
+  def merge(series, drop) do
+    series
+    |> Enum.frequencies_by(&Map.drop(&1, drop))
+    |> Enum.sort()
+  end
+end
+```
+
+```elixir
+defmodule Tour.ChronosphereTest do
+  use ExUnit.Case, async: true
+
+  alias Tour.Core.Rollup
+  alias Tour.Core.RollupRule
+
+  test "the required rule ticks every requirement" do
+    assert Enum.all?(RollupRule.check(RollupRule.required()), fn {_requirement, met?} -> met? end)
+  end
+
+  test "the builder writes the committed file, given the required values" do
+    committed =
+      File.read!(Path.join(Tour.Config.repo(), "chronosphere/rollup-http-requests-total.yaml"))
+
+    assert RollupRule.same?(RollupRule.to_yaml(RollupRule.required()), committed)
+  end
+
+  test "keeping raw data or removing route fails the check" do
+    checks =
+      Map.new(
+        RollupRule.check(%{
+          RollupRule.required()
+          | drop_raw: false,
+            discard: ["pod", "instance", "route"]
+        })
+      )
+
+    refute checks["Drops the raw data"]
+    refute checks["Removes nothing else, so `method`, `route`, and `status` survive"]
+    assert checks["Removes `pod` and `instance`"]
+  end
+
+  test "pods and deploys multiply raw series, and the roll-up keeps one per label set" do
+    assert Rollup.estimate(%{pods: 2, combos: 3, deploys_per_day: 0}) == %{
+             raw_series: 6,
+             rolled_series: 3
+           }
+
+    assert Rollup.estimate(%{pods: 50, combos: 12, deploys_per_day: 10}) ==
+             %{raw_series: 6_600, rolled_series: 12}
+  end
+
+  test "removing pod and instance merges one series per container into one" do
+    series =
+      for pod <- ["a", "b"],
+          status <- ["200", "400"],
+          do: %{"pod" => pod, "instance" => pod <> ":9568", "status" => status}
+
+    assert Rollup.merge(series, ["pod", "instance"]) == [
+             {%{"status" => "200"}, 2},
+             {%{"status" => "400"}, 2}
+           ]
+  end
+end
+
+ExUnit.run()
+```
+
+Change a field to see the YAML and checklist update. The defaults match the committed file.
+
+````elixir
+builder =
+  Kino.Control.form(
+    [
+      metric: Kino.Input.text("Metric", default: "http_requests_total"),
+      env: Kino.Input.text("env", default: "production"),
+      pod: Kino.Input.checkbox("Remove pod", default: true),
+      instance: Kino.Input.checkbox("Remove instance", default: true),
+      route: Kino.Input.checkbox("Remove route"),
+      status: Kino.Input.checkbox("Remove status"),
+      interval:
+        Kino.Input.select("Interval", [
+          {"60s", "60s"},
+          {"15s", "15s"},
+          {"30s", "30s"},
+          {"5m", "5m"}
+        ]),
+      drop_raw: Kino.Input.checkbox("Drop the raw data", default: true),
+      mode: Kino.Input.select("Mode", [{"ENABLED", "ENABLED"}, {"PREVIEW", "PREVIEW"}])
+    ],
+    report_changes: true
+  )
+
+rule_out = Tour.UI.frame()
+committed_path = Path.join(Tour.Config.repo(), "chronosphere/rollup-http-requests-total.yaml")
+
+show_rule = fn rule ->
+  yaml = Tour.Core.RollupRule.to_yaml(rule)
+
+  checklist =
+    Enum.map_join(Tour.Core.RollupRule.check(rule), "\n", fn {text, met?} ->
+      "* #{Tour.UI.mark(if met?, do: :ok, else: :error)} #{text}"
+    end)
+
+  file =
+    case File.read(committed_path) do
+      {:ok, committed} ->
+        if Tour.Core.RollupRule.same?(yaml, committed),
+          do:
+            "#{Tour.UI.mark(:ok)} Same as `chronosphere/rollup-http-requests-total.yaml`, comments aside.",
+          else: "#{Tour.UI.mark(:info)} Different from the committed file."
+
+      {:error, _reason} ->
+        "#{Tour.UI.mark(:warn)} Couldn't read the committed file."
+    end
+
+  Kino.Layout.grid(
+    [
+      Kino.Markdown.new("```yaml\n#{yaml}```"),
+      Kino.Markdown.new("**Requirements**\n\n#{checklist}\n\n#{file}")
+    ],
+    columns: 2
+  )
+end
+
+Kino.Frame.render(rule_out, show_rule.(Tour.Core.RollupRule.required()))
+
+Kino.listen(builder, fn %{data: data} ->
+  discard =
+    for label <- [:pod, :instance, :route, :status],
+        Map.fetch!(data, label),
+        do: Atom.to_string(label)
+
+  rule = %{
+    metric: data.metric,
+    env: data.env,
+    discard: discard,
+    interval: data.interval,
+    drop_raw: data.drop_raw,
+    mode: data.mode
+  }
+
+  Tour.UI.draw(rule_out, fn -> show_rule.(rule) end)
+end)
+
+Tour.UI.stack([builder, rule_out])
+````
+
+The rule matches `http_requests_total` series with `env=production`. Every 60 seconds it sums the increase of all series that become identical once `pod` and `instance` are removed, and stores the result as the counter `http_requests_total:without_pod_instance`. `discard` keeps every other label (`keep` would skip series missing a listed label). `drop_raw: true` means the per-pod series aren't stored.
+
+With `drop_raw`, queries on `http_requests_total{env="production"}` return nothing once the rule is enabled, dashboards and alerts included. The rollout is `mode: PREVIEW` first, which reports impact without changing stored data, then moving dashboards and alerts to the new name, then `ENABLED`. After that, long-term storage has no per-pod data.
+
+Each container exports its own `http_requests_total` series for every method, route, and status it has served. Without `pod` and `instance`, those merge into one series per method, route, and status. On Kubernetes each deploy renames every pod and starts a new set of series, so the raw count also grows with deploys. The roll-up also stores one point a minute instead of one per 15 second scrape.
+
+```elixir
+examples = [
+  {"50 pods, 12 method, route, and status combinations",
+   %{pods: 50, combos: 12, deploys_per_day: 0}},
+  {"The same over a day with 10 deploys", %{pods: 50, combos: 12, deploys_per_day: 10}}
+]
+
+example_rows =
+  for {label, fleet} <- examples do
+    %{raw_series: raw, rolled_series: rolled} = Tour.Core.Rollup.estimate(fleet)
+    [label, Tour.UI.count(raw), Tour.UI.count(rolled)]
+  end
+
+series_now = fn ->
+  case Tour.Prom.query(~s|http_requests_total{env="production"}|) do
+    {:ok, samples} ->
+      merged = Tour.Core.Rollup.merge(Enum.map(samples, & &1.labels), ["pod", "instance"])
+
+      now = [
+        "This stack now, #{length(Tour.Docker.apps())} containers",
+        length(samples),
+        length(merged)
+      ]
+
+      detail =
+        for {labels, n} <- merged, do: [labels["method"], labels["route"], labels["status"], n, 1]
+
+      Tour.UI.stack([
+        Tour.UI.table(["", "Raw series", "After the roll-up"], [now | example_rows]),
+        Tour.UI.table(
+          ["method", "route", "status", "Raw series, one per container", "After"],
+          detail
+        )
+      ])
+
+    {:error, reason} ->
+      Tour.UI.note(:error, reason)
+  end
+end
+
+recount = Kino.Control.button("Count again")
+counts = Tour.UI.frame()
+Tour.UI.draw(counts, series_now)
+Kino.listen(recount, fn _click -> Tour.UI.draw(counts, series_now) end)
+Tour.UI.stack([counts, recount])
+```
+
+The three committed rule files:
+
+````elixir
+["rollup-http-requests-total.yaml", "drop-health-checks.yaml", "derived-error-ratio.yaml"]
+|> Enum.map(fn file ->
+  body =
+    case File.read(Path.join([Tour.Config.repo(), "chronosphere", file])) do
+      {:ok, text} -> "```yaml\n#{text}```"
+      {:error, reason} -> "Couldn't read it: #{:file.format_error(reason)}"
+    end
+
+  {file, Kino.Markdown.new(body)}
+end)
+|> Kino.Layout.tabs()
+````
+
+## The requirements, checked live
+
+Each requirement for the app, checked against the running stack and the repo.
+
+````elixir
+defmodule Tour.Core.Scorecard do
+  @moduledoc """
+  Grades the app's requirements one by one, from evidence the notebook gathered from the
+  running stack and the repo.
+  """
+
+  @type row :: %{ask: String.t(), level: :ok | :error, evidence: String.t()}
+
+  @app_reasons ~w(missing_id invalid_format year_out_of_range catalog_unavailable)
+  @rule_files [
+    "derived-error-ratio.yaml",
+    "drop-health-checks.yaml",
+    "rollup-http-requests-total.yaml"
+  ]
+
+  @doc "One row per requirement, judged from `facts`."
+  @spec rows(map()) :: [row()]
+  def rows(facts) do
+    [
+      service(facts.listed),
+      validity(facts.junk),
+      log_line(facts.log),
+      app_errors(facts.error_reasons),
+      instrument(
+        facts.catalog,
+        "A histogram tracking latency",
+        "kev_process_duration_seconds",
+        "histogram"
+      ),
+      instrument(facts.catalog, "A success counter", "kev_process_success_total", "counter"),
+      instrument(facts.catalog, "An errors counter", "kev_process_errors_total", "counter"),
+      instrument(facts.catalog, "A gauge", "kev_catalog_age_seconds", "gauge"),
+      readme(facts.readme, "README: setup instructions", "## Run it"),
+      readme(facts.readme, "README: run commands", "make up"),
+      promql_count(facts.readme),
+      scraping(facts.targets),
+      shaping(facts.rule_files),
+      rollup(facts.rule)
+    ]
+  end
+
+  defp service({:ok, %{status: 200, body: %{"cve_id" => id}, ms: ms}}),
+    do:
+      row(
+        "An HTTP service with `/process?id=...`",
+        :ok,
+        "`/process?id=#{id}` answered 200 in #{Float.round(ms, 1)} ms."
+      )
+
+  defp service(other), do: row("An HTTP service with `/process?id=...`", :error, failure(other))
+
+  defp validity({:ok, %{status: 400, body: %{"error" => "invalid_format"}}}),
+    do:
+      row(
+        "A trivial operation: is the ID valid?",
+        :ok,
+        "`/process?id=123` answered 400 `invalid_format`."
+      )
+
+  defp validity(other), do: row("A trivial operation: is the ID valid?", :error, failure(other))
+
+  defp log_line({:ok, container, _line}),
+    do:
+      row(
+        "A log line per lookup",
+        :ok,
+        "Found that lookup's JSON line in `#{container}` by its request ID."
+      )
+
+  defp log_line(:error),
+    do: row("A log line per lookup", :error, "Couldn't find the lookup's log line.")
+
+  defp app_errors(reasons) do
+    case Enum.filter(reasons, &(&1 in @app_reasons)) do
+      [] ->
+        row(
+          "An error counter from app logic, not HTTP status",
+          :error,
+          "No app-level reasons on `kev_process_errors_total`."
+        )
+
+      found ->
+        row(
+          "An error counter from app logic, not HTTP status",
+          :ok,
+          "`kev_process_errors_total{reason}` counts #{Enum.join(found, ", ")}."
+        )
+    end
+  end
+
+  defp instrument(catalog, ask, name, type) do
+    case Enum.find(catalog, &(&1.name == name and &1.type == type)) do
+      %{help: help} -> row(ask, :ok, "`#{name}`, a #{type}: #{help}")
+      nil -> row(ask, :error, "No #{type} named `#{name}` on `/metrics`.")
+    end
+  end
+
+  defp readme({:ok, text}, ask, marker) do
+    if String.contains?(text, marker),
+      do: row(ask, :ok, "README.md has `#{marker}`."),
+      else: row(ask, :error, "README.md has no `#{marker}`.")
+  end
+
+  defp readme({:error, _reason}, ask, _marker), do: row(ask, :error, "Couldn't read README.md.")
+
+  defp promql_count({:ok, text}) do
+    case length(Regex.scan(~r/```promql/, text)) do
+      count when count >= 2 ->
+        row("README: two PromQL queries", :ok, "README.md has #{count} PromQL blocks.")
+
+      count ->
+        row("README: two PromQL queries", :error, "README.md has #{count} PromQL blocks.")
+    end
+  end
+
+  defp promql_count({:error, _reason}),
+    do: row("README: two PromQL queries", :error, "Couldn't read README.md.")
+
+  defp scraping({:ok, targets}) do
+    apps = Enum.filter(targets, &(get_in(&1, ["labels", "job"]) == "kev-check"))
+
+    case Enum.count(apps, &(&1["health"] == "up")) do
+      0 ->
+        row("A local Prometheus scraping the app", :error, "No app target is up.")
+
+      up ->
+        row(
+          "A local Prometheus scraping the app",
+          :ok,
+          "Prometheus scrapes #{up} of #{length(apps)} app containers, every 15s."
+        )
+    end
+  end
+
+  defp scraping({:error, reason}), do: row("A local Prometheus scraping the app", :error, reason)
+
+  defp shaping({:ok, files}) do
+    case @rule_files -- files do
+      [] ->
+        row(
+          "Drop, recording, roll-up, and derived rules",
+          :ok,
+          "Drop, roll-up, and derived examples are in `chronosphere/`, recording rules in `ops/prometheus/rules.yml`."
+        )
+
+      missing ->
+        row(
+          "Drop, recording, roll-up, and derived rules",
+          :error,
+          "Missing from `chronosphere/`: #{Enum.join(missing, ", ")}."
+        )
+    end
+  end
+
+  defp shaping({:error, _reason}),
+    do: row("Drop, recording, roll-up, and derived rules", :error, "No `chronosphere/` folder.")
+
+  defp rollup(%{same?: true, checks: checks}) do
+    case for({text, false} <- checks, do: text) do
+      [] ->
+        row(
+          "The roll-up rule, in chronoctl format",
+          :ok,
+          "`chronosphere/rollup-http-requests-total.yaml` meets all #{length(checks)} requirements."
+        )
+
+      unmet ->
+        row("The roll-up rule, in chronoctl format", :error, "Unmet: #{Enum.join(unmet, "; ")}.")
+    end
+  end
+
+  defp rollup(_different),
+    do:
+      row(
+        "The roll-up rule, in chronoctl format",
+        :error,
+        "The committed file doesn't match the required rule."
+      )
+
+  defp failure({:ok, %{status: status}}), do: "Answered HTTP #{status}."
+  defp failure({:error, reason}), do: reason
+
+  defp row(ask, level, evidence), do: %{ask: ask, level: level, evidence: evidence}
+end
+````
+
+````elixir
+defmodule Tour.ScorecardTest do
+  use ExUnit.Case, async: true
+
+  alias Tour.Core.RollupRule
+  alias Tour.Core.Scorecard
+
+  @good %{
+    listed: {:ok, %{status: 200, body: %{"cve_id" => "CVE-2021-44228"}, ms: 12.0}},
+    junk: {:ok, %{status: 400, body: %{"error" => "invalid_format"}}},
+    log: {:ok, "kev-check-app-1", "{}"},
+    error_reasons: ["invalid_format", "missing_id"],
+    catalog: [
+      %{name: "kev_process_duration_seconds", type: "histogram", help: "h"},
+      %{name: "kev_process_success_total", type: "counter", help: "s"},
+      %{name: "kev_process_errors_total", type: "counter", help: "e"},
+      %{name: "kev_catalog_age_seconds", type: "gauge", help: "g"}
+    ],
+    readme: {:ok, "## Run it\nmake up\n```promql\na\n```\n```promql\nb\n```"},
+    targets: {:ok, [%{"labels" => %{"job" => "kev-check"}, "health" => "up"}]},
+    rule_files:
+      {:ok,
+       ["derived-error-ratio.yaml", "drop-health-checks.yaml", "rollup-http-requests-total.yaml"]},
+    rule: %{same?: true, checks: RollupRule.check(RollupRule.required())}
+  }
+
+  test "a healthy stack passes every row" do
+    rows = Scorecard.rows(@good)
+    assert length(rows) == 14
+    assert Enum.all?(rows, &(&1.level == :ok))
+  end
+
+  test "a stack that's down fails with reasons, and nothing crashes" do
+    down = %{
+      @good
+      | listed: {:error, "The app isn't answering"},
+        junk: {:error, "The app isn't answering"},
+        log: :error,
+        error_reasons: [],
+        catalog: [],
+        targets: {:error, "Prometheus isn't answering"}
+    }
+
+    failed = for %{level: :error, ask: ask} <- Scorecard.rows(down), do: ask
+    assert "An HTTP service with `/process?id=...`" in failed
+    assert "A gauge" in failed
+    assert length(failed) == 9
+  end
+end
+
+ExUnit.run()
+````
+
+```elixir
+defmodule Tour.Scorecard do
+  @moduledoc """
+  Gathers the evidence for the requirements scorecard, from the app, a container's `/metrics`,
+  the logs, Prometheus, and the repo, then shows the grades.
+  """
+
+  alias Tour.Core.Exposition
+  alias Tour.Core.RollupRule
+
+  @doc "The scorecard as a table."
+  @spec board() :: Kino.Markdown.t()
+  def board do
+    rows =
+      for row <- Tour.Core.Scorecard.rows(gather()),
+          do: [Tour.UI.mark(row.level), row.ask, row.evidence]
+
+    Tour.UI.table(["", "Requirement", "Evidence"], rows)
+  end
+
+  defp gather do
+    listed = Tour.App.lookup("CVE-2021-44228")
+    metrics = metrics()
+    repo = Tour.Config.repo()
+
+    %{
+      listed: listed,
+      junk: Tour.App.lookup("123"),
+      log: log(listed),
+      error_reasons: Exposition.label_values(metrics, "kev_process_errors_total", "reason"),
+      catalog: Exposition.catalog(metrics),
+      readme: File.read(Path.join(repo, "README.md")),
+      targets: Tour.Prom.targets(),
+      rule_files: File.ls(Path.join(repo, "chronosphere")),
+      rule: rule(Path.join(repo, "chronosphere/rollup-http-requests-total.yaml"))
+    }
+  end
+
+  defp log({:ok, %{request_id: request_id}}), do: Tour.Docker.find_log(request_id)
+  defp log({:error, _reason}), do: :error
+
+  defp metrics do
+    with [container | _others] <- Tour.Docker.apps(),
+         {:ok, text} <- Tour.App.metrics(container.ports[9568]) do
+      Exposition.parse(text)
+    else
+      _not_running -> Exposition.parse("")
+    end
+  end
+
+  defp rule(path) do
+    required = RollupRule.required()
+
+    case File.read(path) do
+      {:ok, committed} ->
+        %{
+          same?: RollupRule.same?(RollupRule.to_yaml(required), committed),
+          checks: RollupRule.check(required)
+        }
+
+      {:error, _reason} ->
+        %{same?: false, checks: []}
+    end
+  end
+end
+```
+
+```elixir
+regrade = Kino.Control.button("Grade it again")
+scorecard = Tour.UI.frame()
+Tour.UI.draw(scorecard, &Tour.Scorecard.board/0)
+Kino.listen(regrade, fn _click -> Tour.UI.draw(scorecard, &Tour.Scorecard.board/0) end)
+Tour.UI.stack([regrade, scorecard])
+```
+
+## Wrap up
+
+Reset faults restores every container's fault settings and unpauses the load generator. Back to two containers undoes Scale.
+
+```elixir
+tidy = Kino.Control.button("Reset faults")
+two = Kino.Control.button("Back to two containers")
+stop = Kino.Control.button("■ Stop (make down)")
+after_out = Tour.UI.frame()
+
+Kino.listen(tidy, fn _click -> Tour.UI.draw(after_out, &Tour.UI.reset_everything/0) end)
+Kino.listen(two, fn _click -> Tour.UI.run_in(after_out, "make", ["scale", "N=2"]) end)
+Kino.listen(stop, fn _click -> Tour.UI.run_in(after_out, "make", ["down"]) end)
+Tour.UI.stack([Kino.Layout.grid([tidy, two, stop], columns: 3), after_out])
+```

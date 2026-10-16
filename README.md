@@ -6,13 +6,7 @@ It's a small service built to be observed. The app exposes Prometheus metrics an
 
 ## Run it
 
-You need Docker Desktop. The stack needs one secret, `SECRET_KEY_BASE`, because a Phoenix release won't boot without it. If you use 1Password, keep it in an item called `kev-check` in your `Private` vault and copy the reference file:
-
-```bash
-cp op.env.example op.env
-```
-
-The Makefile then wraps every Compose command in `op run`, so the value never touches disk. Set `OP_ACCOUNT` if your 1Password CLI has more than one account. Without 1Password, put a value in `.env`:
+You need Docker Desktop. The stack needs one secret, `SECRET_KEY_BASE`, because a Phoenix release won't boot without it. Put a random value in `.env`, which Compose reads on every command and git ignores:
 
 ```bash
 echo "SECRET_KEY_BASE=$(openssl rand -base64 48)" > .env
@@ -54,7 +48,9 @@ curl -s -w ' %{http_code}\n' 'localhost:8080/process?id=123'
 {"error":"invalid_format","message":"Expected an ID shaped like CVE-YYYY-NNNN."} 400
 ```
 
-`make help` lists every target. The demo uses `make faults`, `make faults-reset`, `make kill-pod`, `make scale N=4`, `make metrics`, and `make logs`. `make down` stops everything and keeps Prometheus's history, and `make clean` deletes it too.
+`make help` lists every target. The ones for trying things out are `make faults`, `make faults-reset`, `make kill-pod`, `make scale N=4`, `make metrics`, and `make logs`. `make down` stops everything and keeps Prometheus's history, and `make clean` deletes it too.
+
+The [Livebook tour](#livebook-tour) runs all of these from buttons instead.
 
 To run it without Docker you need Elixir 1.18 or later. Run `mix setup`, then `mix phx.server`, and the API is on port 4000 with metrics on 9568. `make check` runs the formatter, the compiler with warnings as errors, Credo, the 111 tests, and Dialyzer, all inside Docker.
 
@@ -165,7 +161,7 @@ The SLO is my pick: 99.9% of requests succeed and 95% finish within 250 ms. The 
 
 Every rule groups by `env`, so the alerts keep working after the roll-up removes `pod`. Alertmanager sends pages to a `pager` receiver and tickets to `tickets` (both empty locally), and mutes the slow-burn ticket while the fast burn is paging. A `Watchdog` alert always fires, so if it ever disappears, alerting itself is broken.
 
-In a test run with a clean hour of history, the fast burn fired 8 minutes after `make faults ERROR_RATE=0.2`, and slow lookups 4 minutes after `make faults LATENCY_MS=400`. The fast burn waits on the 1 hour ratio, which took 6 minutes to pass 1.44%. The paging alerts wait 2 minutes so they fire during a demo. In production I'd use 5 or more.
+In a test run with a clean hour of history, the fast burn fired 8 minutes after `make faults ERROR_RATE=0.2`, and slow lookups 4 minutes after `make faults LATENCY_MS=400`. The fast burn waits on the 1 hour ratio, which took 6 minutes to pass 1.44%. The paging alerts wait 2 minutes so they fire quickly on a laptop. In production I'd use 5 or more.
 
 ## Many copies and many services
 
@@ -177,15 +173,13 @@ Past one Prometheus, I'd run one per cluster and `remote_write` to Chronosphere 
 
 With more services I'd add OpenTelemetry. Every service would get the same rate, error, and duration metrics with the same labels, and W3C trace context on every call, so one request becomes one trace. Exemplars would link a slow histogram bucket to a trace that landed in it. An OpenTelemetry Collector would batch, sample, and forward everything to Chronosphere.
 
-## Drive the demo from Livebook
+## Livebook tour
 
-<!-- livebook: replace this section once livebook/tour.livemd exists, and bring the Demo walkthrough in line with the notebook's sections. -->
+[`livebook/tour.livemd`](livebook/tour.livemd) drives the same stack from a notebook. It starts, scales, and stops the containers, turns the fault knobs, and shows each part of this README live, with charts and its own tests. Open it in [Livebook Desktop](https://livebook.dev), run the Toolbox section, press Start in the Control room, then run Preflight. The first run downloads three libraries, which takes about a minute.
 
-The Livebook tour isn't in the repo yet. Until it is, the walkthrough below is the whole demo.
+## Walkthrough from a terminal
 
-## Demo walkthrough
-
-Start `make up` an hour before, so the 1 hour alert windows have data.
+The same order as the notebook's sections. Give the stack an hour after `make up`, so the 1 hour alert windows have data.
 
 1. `curl` a listed ID, an unlisted one, and `123`. A no is still an answer, and `123` is an app-level error.
 2. Open `lib/kev_check/lookup.ex` and `lib/kev_check_web/telemetry.ex`. One span feeds five signals, and the CVE ID stays in logs.
@@ -197,7 +191,6 @@ Start `make up` an hour before, so the 1 hour alert windows have data.
 8. `make faults-reset`, then `make faults LATENCY_MS=400`. p95 climbs, and slow lookups fires about 4 minutes later.
 9. `make faults-reset`, then `make kill-pod`. Graph `sum(rate(kev_process_success_total[1m]))` next to `rate(sum(kev_process_success_total)[1m:15s])`.
 10. The series counts, then the `chronosphere/` files: roll-up versus recording, derived, and drop, `PREVIEW` first, and the naming catch.
-11. Open discussion: limits and what I'd do next.
 
 A slow-burn ticket shows up about 17 minutes after step 5. The 6 hour window only holds the history the stack has, so a short burst reads as a big share. It's not a bad rule.
 
@@ -214,7 +207,7 @@ A slow-burn ticket shows up about 17 minutes after step 5. The 6 hour window onl
 
 ## Code layout
 
-`lib/kev_check/core/` is pure code: it parses an ID, parses CISA's feed, and answers a lookup. Everything that holds state or does I/O sits around it, and the `boundary` library fails the build if the core calls Req or Jason. Start reading at `lib/kev_check/lookup.ex`. The Prometheus and Alertmanager config is in `ops/`, and `make reload` runs the rule tests in `ops/prometheus/rules_test.yml` before reloading Prometheus.
+`lib/kev_check/core/` is pure code: it parses an ID, parses CISA's feed, and answers a lookup. Everything that holds state or does I/O sits around it, and the `boundary` library fails the build if the core calls Req or Jason. Start reading at `lib/kev_check/lookup.ex`. The Livebook tour is in `livebook/`, and the Prometheus and Alertmanager config in `ops/`, and `make reload` runs the rule tests in `ops/prometheus/rules_test.yml` before reloading Prometheus.
 
 ## Sources
 

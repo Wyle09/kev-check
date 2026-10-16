@@ -1409,7 +1409,7 @@ Errors are counted by the app's reason, not the HTTP status: `123` returns 400 a
 ```elixir
 presets = [
   {"Log4Shell", "CVE-2021-44228"},
-  {"Messy but valid", "  cve-2023-4966 "},
+  {"Lowercase with spaces", "  cve-2023-4966 "},
   {"Not on the list", "CVE-2023-99999"},
   {"Not a CVE", "123"},
   {"From the future", "CVE-2099-0001"},
@@ -1442,12 +1442,18 @@ headline = fn
     "**HTTP #{status}** #{inspect(body)}"
 end
 
+# The app trims and upcases an ID before the lookup, so say when the answer is for a cleaned-up ID.
+sent = fn
+  value, %{"cve_id" => id} when id != value -> "Sent `#{inspect(value)}`, answered for `#{id}`"
+  value, _body -> "Sent `#{inspect(value)}`"
+end
+
 show = fn value ->
   Tour.UI.draw(answer, fn ->
     case Tour.App.lookup(value) do
       {:ok, reply} ->
         meta =
-          "`GET /process?id=#{value}` · #{Float.round(reply.ms, 1)} ms · request `#{reply.request_id}`"
+          "#{sent.(value, reply.body)} · #{Float.round(reply.ms, 1)} ms · request `#{reply.request_id}`"
 
         Tour.UI.stack([
           Kino.Markdown.new(headline.(reply) <> "\n\n" <> meta),
